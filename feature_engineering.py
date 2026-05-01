@@ -1100,6 +1100,49 @@ def attach_batting_quality(games: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------------
+# Step 9b – prior-season Pythagorean win%
+#
+# Pythagorean win% = RS² / (RS² + RA²) per team per season.
+# We use year-1 so there's no leakage: a 2026 game gets 2025 win%.
+# This anchors team quality for teams on unsustainable hot/cold streaks.
+# ---------------------------------------------------------------------------
+
+def attach_prior_win_pct(games: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute Pythagorean win% (RS²/(RS²+RA²)) per team per season from the
+    games DataFrame itself, then join year-1 values as home/away features.
+    """
+    # Build a long-form view: one row per team per game with RS and RA
+    home_view = games[["Date", "year", "home_team", "home_runs", "away_runs"]].copy()
+    home_view.columns = ["Date", "year", "team", "rs", "ra"]
+    away_view = games[["Date", "year", "away_team", "away_runs", "home_runs"]].copy()
+    away_view.columns = ["Date", "year", "team", "rs", "ra"]
+    long = pd.concat([home_view, away_view], ignore_index=True)
+
+    season = (long.groupby(["team", "year"])
+                  .agg(rs=("rs", "sum"), ra=("ra", "sum"))
+                  .reset_index())
+    season["pyth_wp"] = season["rs"] ** 2 / (season["rs"] ** 2 + season["ra"] ** 2)
+
+    # Shift: season Y win% → games in year Y+1
+    shifted = season[["team", "year", "pyth_wp"]].copy()
+    shifted["year"] = shifted["year"] + 1
+
+    games = games.merge(
+        shifted.rename(columns={"team": "home_team", "pyth_wp": "home_prior_win_pct"}),
+        on=["home_team", "year"], how="left",
+    )
+    games = games.merge(
+        shifted.rename(columns={"team": "away_team", "pyth_wp": "away_prior_win_pct"}),
+        on=["away_team", "year"], how="left",
+    )
+
+    cov = games["home_prior_win_pct"].notna().mean()
+    print(f"  Prior-season Pythagorean win% coverage: {cov:.1%}")
+    return games
+
+
+# ---------------------------------------------------------------------------
 # Step 10 – head-to-head matchup history
 #
 # For each game (home_team H vs away_team A) we look back at the last
@@ -1409,6 +1452,10 @@ FEATURE_COLS = [
     "home_team_ops",
     "away_team_ops",
     "ops_diff",
+    # Prior-season Pythagorean win% (stable team quality anchor)
+    "home_prior_win_pct",
+    "away_prior_win_pct",
+    "prior_win_pct_diff",
     # Game-time weather at home park
     "temp_f",
     "wind_speed_mph",
@@ -1485,6 +1532,7 @@ def build_feature_matrix(games: pd.DataFrame) -> pd.DataFrame:
     games["travel_diff"]               = games["away_travel_miles"]         - games["home_travel_miles"]
     games["bullpen_usage_diff"]        = games["away_bullpen_outs_3d"]      - games["home_bullpen_outs_3d"]
     games["ops_diff"]                  = games["home_team_ops"]             - games["away_team_ops"]
+    games["prior_win_pct_diff"]        = games["home_prior_win_pct"]        - games["away_prior_win_pct"]
     # SP stuff diffs (higher FBv/K%/SwStr% + lower xFIP favors home)
     if "home_sp_fbv" in games.columns:
         games["sp_fbv_diff"]   = games["home_sp_fbv"]   - games["away_sp_fbv"]
@@ -1624,6 +1672,9 @@ if __name__ == "__main__":
 
     print("Attaching prior-season batting quality (team OPS)...")
     games = attach_batting_quality(games, batting_stats)
+
+    print("Attaching prior-season Pythagorean win%...")
+    games = attach_prior_win_pct(games)
 
     print("Computing head-to-head history...")
     games = compute_h2h_stats(games)

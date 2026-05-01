@@ -373,6 +373,7 @@ def get_latest_team_features(team: str,
         "last7_rd":             last.get(f"{prefix}_last7_rd",             np.nan),
         "streak":               current_streak,
         "momentum":             last.get(f"{prefix}_momentum",             np.nan),
+        "prior_win_pct":        last.get(f"{prefix}_prior_win_pct",        np.nan),
     }
 
 
@@ -520,6 +521,9 @@ def build_input_row(home: dict, away: dict) -> pd.DataFrame:
         "home_sp_pa":    home.get("sp_pa",    np.nan),
         "away_sp_pa":    away.get("sp_pa",    np.nan),
         "sp_pa_diff":    _safe_diff(home.get("sp_pa"),    away.get("sp_pa")),
+        "home_prior_win_pct": home.get("prior_win_pct", np.nan),
+        "away_prior_win_pct": away.get("prior_win_pct", np.nan),
+        "prior_win_pct_diff": _safe_diff(home.get("prior_win_pct"), away.get("prior_win_pct")),
         # Prior-season Statcast power metrics
         "home_barrel_pct":   home.get("barrel_pct",   np.nan),
         "away_barrel_pct":   away.get("barrel_pct",   np.nan),

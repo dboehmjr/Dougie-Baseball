@@ -92,6 +92,10 @@ FEATURE_COLS = [
     "home_team_ops",
     "away_team_ops",
     "ops_diff",
+    # Prior-season Pythagorean win% (stable team quality anchor)
+    "home_prior_win_pct",
+    "away_prior_win_pct",
+    "prior_win_pct_diff",
     # Game-time weather at home park
     "temp_f",
     "wind_speed_mph",
