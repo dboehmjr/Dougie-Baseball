@@ -517,6 +517,9 @@ def build_input_row(home: dict, away: dict) -> pd.DataFrame:
         "home_sp_xfip":  home.get("sp_xfip",  np.nan),
         "away_sp_xfip":  away.get("sp_xfip",  np.nan),
         "sp_xfip_diff":  _safe_diff(away.get("sp_xfip"),  home.get("sp_xfip")),
+        "home_sp_pa":    home.get("sp_pa",    np.nan),
+        "away_sp_pa":    away.get("sp_pa",    np.nan),
+        "sp_pa_diff":    _safe_diff(home.get("sp_pa"),    away.get("sp_pa")),
         # Prior-season Statcast power metrics
         "home_barrel_pct":   home.get("barrel_pct",   np.nan),
         "away_barrel_pct":   away.get("barrel_pct",   np.nan),
@@ -704,10 +707,12 @@ def predict_matchup(home_team: str,
         home_feats.update({k: v for k, v in {
             "sp_fbv": home_stuff["FBv"], "sp_swstr": home_stuff["SwStr_pct"],
             "sp_k_pct": home_stuff["K_pct"], "sp_xfip": home_stuff["xFIP"],
+            "sp_pa": home_stuff.get("pa", np.nan),
         }.items()})
         away_feats.update({k: v for k, v in {
             "sp_fbv": away_stuff["FBv"], "sp_swstr": away_stuff["SwStr_pct"],
             "sp_k_pct": away_stuff["K_pct"], "sp_xfip": away_stuff["xFIP"],
+            "sp_pa": away_stuff.get("pa", np.nan),
         }.items()})
         home_sp_throws = home_stuff.get("Throws")
         away_sp_throws = away_stuff.get("Throws")

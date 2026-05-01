@@ -256,7 +256,7 @@ def get_pitcher_stuff(name_norm: str,
     Falls back to team median if the pitcher isn't found at all.
     """
     empty = {"FBv": np.nan, "SwStr_pct": np.nan, "K_pct": np.nan,
-             "BB_pct": np.nan, "xFIP": np.nan, "Throws": None}
+             "BB_pct": np.nan, "xFIP": np.nan, "Throws": None, "pa": np.nan}
 
     if stuff_df is None or stuff_df.empty:
         return empty

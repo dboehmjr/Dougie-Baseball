@@ -587,7 +587,7 @@ def attach_sp_stuff(games: pd.DataFrame,
     if pitcher_stuff is None or pitcher_stuff.empty:
         for col in ["home_sp_fbv", "away_sp_fbv", "home_sp_swstr", "away_sp_swstr",
                     "home_sp_k_pct", "away_sp_k_pct", "home_sp_xfip", "away_sp_xfip",
-                    "home_sp_throws", "away_sp_throws"]:
+                    "home_sp_throws", "away_sp_throws", "home_sp_pa", "away_sp_pa"]:
             games[col] = np.nan
         print("  SP stuff: pitcher_stuff.csv not found — all NaN")
         return games
@@ -607,6 +607,7 @@ def attach_sp_stuff(games: pd.DataFrame,
     swstr_lk   = _make_lookup("SwStr_pct")
     kpct_lk    = _make_lookup("K_pct")
     xfip_lk    = _make_lookup("xFIP")
+    pa_lk      = _make_lookup("pa")
     throws_lk  = (stuff.dropna(subset=["name_norm", "Throws"])
                        .set_index(["name_norm", "year"])["Throws"].to_dict()
                   if "Throws" in stuff.columns else {})
@@ -637,6 +638,8 @@ def attach_sp_stuff(games: pd.DataFrame,
                                        for n, t, y in zip(name, team, yr)]
         games[f"{side}_sp_xfip"]   = [_lookup(n, t, y, xfip_lk,   team_xfip)
                                        for n, t, y in zip(name, team, yr)]
+        games[f"{side}_sp_pa"]     = [pa_lk.get((n, y), np.nan) if n else np.nan
+                                       for n, y in zip(name, yr)]
         games[f"{side}_sp_throws"] = [throws_lk.get((n, y)) if n else None
                                        for n, y in zip(name, yr)]
 
@@ -1440,6 +1443,10 @@ FEATURE_COLS = [
     "home_sp_xfip",
     "away_sp_xfip",
     "sp_xfip_diff",
+    # SP sample size — PA batted in current season (low = stats less reliable)
+    "home_sp_pa",
+    "away_sp_pa",
+    "sp_pa_diff",
     # Prior-season Statcast power metrics (barrel rate, hard hit%)
     "home_barrel_pct",
     "away_barrel_pct",
@@ -1484,6 +1491,7 @@ def build_feature_matrix(games: pd.DataFrame) -> pd.DataFrame:
         games["sp_swstr_diff"] = games["home_sp_swstr"] - games["away_sp_swstr"]
         games["sp_k_pct_diff"] = games["home_sp_k_pct"] - games["away_sp_k_pct"]
         games["sp_xfip_diff"]  = games["away_sp_xfip"]  - games["home_sp_xfip"]
+        games["sp_pa_diff"]    = games["home_sp_pa"]    - games["away_sp_pa"]
     # Prior-season Statcast power metrics
     if "home_barrel_pct" in games.columns:
         games["barrel_pct_diff"]   = games["home_barrel_pct"]   - games["away_barrel_pct"]

@@ -126,6 +126,10 @@ FEATURE_COLS = [
     "home_sp_xfip",
     "away_sp_xfip",
     "sp_xfip_diff",
+    # SP sample size — PA batted in current season (low = stats less reliable)
+    "home_sp_pa",
+    "away_sp_pa",
+    "sp_pa_diff",
     # Prior-season Statcast power metrics (barrel rate, hard hit%)
     "home_barrel_pct",
     "away_barrel_pct",
