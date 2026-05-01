@@ -223,7 +223,7 @@ def refresh_recent_weather(cache_path: str = CACHE_PATH,
     max_date = existing["date"].max()
     archive_end = pd.Timestamp.today().normalize() - pd.Timedelta(days=2)
 
-    if max_date >= archive_end - pd.Timedelta(days=stale_days):
+    if max_date >= archive_end:
         print(f"Weather cache is current (through {max_date.date()}).")
         return existing
 

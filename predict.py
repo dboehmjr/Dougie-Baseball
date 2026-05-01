@@ -310,9 +310,36 @@ def compute_h2h_live(home_team: str,
     }
 
 
+def _compute_current_streak(team: str, last_features_date: pd.Timestamp,
+                             last_streak: float, live_logs: pd.DataFrame | None) -> float:
+    """
+    Update a streak by replaying any game results in live_logs that occurred
+    after the last features.csv snapshot date.
+    Streak sign convention: positive = win streak length, negative = loss streak length.
+    """
+    if live_logs is None or live_logs.empty:
+        return last_streak
+
+    live_logs = live_logs.copy()
+    live_logs["Date"] = pd.to_datetime(live_logs["Date"])
+    newer = live_logs[live_logs["Date"] >= last_features_date].sort_values("Date")
+    team_games = newer[(newer["home_team"] == team) | (newer["away_team"] == team)]
+
+    streak = last_streak
+    for _, row in team_games.iterrows():
+        is_home = row["home_team"] == team
+        won = (row["home_win"] == 1) if is_home else (row["home_win"] == 0)
+        if won:
+            streak = (streak + 1) if streak > 0 else 1
+        else:
+            streak = (streak - 1) if streak < 0 else -1
+    return streak
+
+
 def get_latest_team_features(team: str,
                               year: int,
-                              features_df: pd.DataFrame) -> dict:
+                              features_df: pd.DataFrame,
+                              live_logs: pd.DataFrame | None = None) -> dict:
     """Return the most recent feature snapshot for a team as a pre-game proxy."""
     mask = (
         ((features_df["home_team"] == team) | (features_df["away_team"] == team))
@@ -331,6 +358,11 @@ def get_latest_team_features(team: str,
 
     is_home = last["home_team"] == team
     prefix = "home" if is_home else "away"
+
+    raw_streak = float(last.get(f"{prefix}_streak", 0.0))
+    current_streak = _compute_current_streak(team, pd.Timestamp(last["Date"]),
+                                             raw_streak, live_logs)
+
     return {
         "rolling_rd":           last.get(f"{prefix}_rolling_rd",           np.nan),
         "rolling_rs":           last.get(f"{prefix}_rolling_rs",           np.nan),
@@ -339,7 +371,7 @@ def get_latest_team_features(team: str,
         "bullpen_inseason_era": last.get(f"{prefix}_bullpen_inseason_era", np.nan),
         "park_factor":          last.get("park_factor", np.nan) if is_home else np.nan,
         "last7_rd":             last.get(f"{prefix}_last7_rd",             np.nan),
-        "streak":               last.get(f"{prefix}_streak",               0.0),
+        "streak":               current_streak,
         "momentum":             last.get(f"{prefix}_momentum",             np.nan),
     }
 
@@ -529,12 +561,13 @@ def predict_matchup(home_team: str,
     feat_cols = artifact["features"]
 
     features_df = _load_csv(os.path.join(DATA_DIR, "features.csv"), parse_dates=["Date"])
+    live_logs   = _load_csv(os.path.join(DATA_DIR, "game_logs_live.csv"), parse_dates=["Date"])
 
     # Resolve game date (default = today)
     gdate = pd.Timestamp(game_date) if game_date else pd.Timestamp.today().normalize()
 
-    home_feats = get_latest_team_features(home_team, year, features_df)
-    away_feats = get_latest_team_features(away_team, year, features_df)
+    home_feats = get_latest_team_features(home_team, year, features_df, live_logs)
+    away_feats = get_latest_team_features(away_team, year, features_df, live_logs)
     home_feats["team"] = home_team
     away_feats["team"] = away_team
 
