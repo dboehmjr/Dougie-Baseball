@@ -1,6 +1,6 @@
 pybaseball>=2.2.7
 pandas>=2.0.0
-numpy>=1.24.0
+numpy>=1.24.0,<2.0
 scikit-learn==1.0.2
 xgboost>=1.7.0
 matplotlib>=3.7.0
