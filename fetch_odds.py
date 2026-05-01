@@ -27,11 +27,21 @@ warnings.filterwarnings("ignore")
 DATA_DIR   = os.path.join(os.path.dirname(__file__), "data")
 CACHE_PATH = os.path.join(DATA_DIR, "odds_cache.csv")
 
-# Load from .env file if env var not set
+# Load from env var, .env file, or Streamlit secrets
 def _load_env_key() -> str:
     key = os.environ.get("ODDS_API_KEY", "")
     if key:
         return key
+    # Try Streamlit secrets (works on Streamlit Community Cloud)
+    try:
+        import streamlit as st
+        key = st.secrets.get("ODDS_API_KEY", "")
+        if key:
+            os.environ["ODDS_API_KEY"] = key  # cache for submodules
+            return key
+    except Exception:
+        pass
+    # Fall back to .env file (local dev)
     env_path = os.path.join(os.path.dirname(__file__), ".env")
     if os.path.exists(env_path):
         with open(env_path) as f:

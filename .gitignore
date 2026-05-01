@@ -1,16 +1,15 @@
-# Large data files (reproducible — run the pipeline to regenerate)
-data/features.csv
+# Large training/raw data files (not needed at runtime)
 data/game_logs_raw.csv
-data/pitcher_game_logs.csv
-data/umpire_game_logs.csv
 data/pitcher_stats.csv
-data/batting_stats.csv
 data/game_sp.csv
-data/weather.csv
 data/backtest_historical_results.csv
+data/mlb-odds-*.xlsx
+data/action_network_odds_2022_2025.csv
+data/historical_odds.csv
 
-# Model artifact (also reproducible)
-models/win_prob_model.pkl
+# Include runtime data files needed for Streamlit Cloud
+# (features.csv, weather.csv, batting_stats.csv, pitcher_game_logs.csv,
+#  umpire_game_logs.csv, win_prob_model.pkl are committed to git)
 
 # Keep these smaller/live data files
 !data/game_logs_live.csv
