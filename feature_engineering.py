@@ -1731,23 +1731,48 @@ if __name__ == "__main__":
     games = attach_inseason_stats(games, game_logs, game_sp, park_factors)
 
     print("Attaching historical Vegas consensus odds...")
+
+    def _devig(hml, aml):
+        def imp(ml):
+            ml = float(ml)
+            return abs(ml) / (abs(ml) + 100) if ml < 0 else 100 / (ml + 100)
+        ph, pa = imp(hml), imp(aml)
+        return ph / (ph + pa) if (ph + pa) > 0 else np.nan
+
     odds_frames = []
-    for odds_file in ["action_network_odds_2026.csv", "historical_odds.csv"]:
+
+    # Action Network files (game_date + consensus_prob already computed)
+    for odds_file in ["action_network_odds_2026.csv", "action_network_odds_2022_2025.csv"]:
         p = os.path.join(DATA_DIR, odds_file)
         if os.path.exists(p):
-            odds_frames.append(pd.read_csv(p, dtype={"game_date": str}))
+            df = pd.read_csv(p, dtype={"game_date": str})
+            df = df.rename(columns={"game_date": "Date", "consensus_prob": "vegas_home_prob"})
+            odds_frames.append(df[["Date", "home_team", "away_team", "vegas_home_prob"]])
+
+    # historical_odds.csv (2015-2021): has 'date' + raw home_ml/away_ml, no consensus_prob
+    hist_path = os.path.join(DATA_DIR, "historical_odds.csv")
+    if os.path.exists(hist_path):
+        hist = pd.read_csv(hist_path)
+        hist = hist.rename(columns={"date": "Date"})
+        hist["vegas_home_prob"] = hist.apply(
+            lambda r: _devig(r["home_ml"], r["away_ml"])
+            if pd.notna(r.get("home_ml")) and pd.notna(r.get("away_ml")) else np.nan,
+            axis=1,
+        )
+        odds_frames.append(hist[["Date", "home_team", "away_team", "vegas_home_prob"]])
+
     if odds_frames:
         odds_df = (pd.concat(odds_frames, ignore_index=True)
-                     .drop_duplicates(["game_date", "home_team", "away_team"]))
-        odds_df = odds_df.rename(columns={"game_date": "Date",
-                                          "consensus_prob": "vegas_home_prob"})
+                     .dropna(subset=["vegas_home_prob"]))
         odds_df["Date"] = pd.to_datetime(odds_df["Date"])
+        odds_df = odds_df.drop_duplicates(["Date", "home_team", "away_team"])
         games = games.merge(
             odds_df[["Date", "home_team", "away_team", "vegas_home_prob"]],
             on=["Date", "home_team", "away_team"], how="left"
         )
         coverage = games["vegas_home_prob"].notna().mean()
-        print(f"  Vegas odds coverage: {coverage:.1%} of games")
+        n_games  = games["vegas_home_prob"].notna().sum()
+        print(f"  Vegas odds coverage: {coverage:.1%} of games ({n_games:,} games)")
     else:
         print("  No odds files found — run fetch_historical_odds.py first")
         games["vegas_home_prob"] = np.nan
