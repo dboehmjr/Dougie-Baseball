@@ -1,0 +1,42 @@
+date,home,away,home_sp,away_sp,model_home_prob,vegas_home_prob,pick,home_score,away_score,home_win,model_correct
+2026-04-29,CLE,TBR,Gavin Williams,Drew Rasmussen,0.3944,0.5211,TBR,3.0,1.0,1.0,False
+2026-04-29,CHW,LAA,Erick Fedde,Yusei Kikuchi,0.4425,0.4774,LAA,3.0,2.0,1.0,False
+2026-04-29,MIN,SEA,Taj Bradley,George Kirby,0.4289,0.456,SEA,3.0,5.0,0.0,True
+2026-04-29,TEX,NYY,Nathan Eovaldi,Elmer Rodríguez,0.4779,0.4789,NYY,3.0,0.0,1.0,False
+2026-04-29,TOR,BOS,Eric Lauer,Brayan Bello,0.602,0.5426,TOR,8.0,1.0,1.0,True
+2026-04-29,LAD,MIA,Tyler Glasnow,Sandy Alcantara,0.5848,0.6644,LAD,2.0,3.0,0.0,False
+2026-04-29,SDP,CHC,Matt Waldron,Jameson Taillon,0.4857,0.4964,CHC,4.0,5.0,0.0,True
+2026-04-29,CIN,COL,Brandon Williamson,Tomoyuki Sugano,0.4755,0.5771,COL,2.0,13.0,0.0,True
+2026-04-29,PIT,STL,Bubba Chandler,Andre Pallante,0.4626,0.5723,STL,4.0,5.0,0.0,True
+2026-04-29,NYM,WSN,David Peterson,Cade Cavalli,0.4914,0.5951,WSN,2.0,14.0,0.0,True
+2026-04-29,ATL,DET,JR Ritchie,Tarik Skubal,0.4593,0.4289,DET,4.0,3.0,1.0,False
+2026-04-29,MIL,ARI,Brandon Sproat,Eduardo Rodriguez,0.4373,0.5275,ARI,2.0,6.0,0.0,True
+2026-04-29,OAK,KCR,Luis Severino,Michael Wacha,0.5071,0.5261,OAK,,,,
+2026-04-29,PHI,SFG,Cristopher Sánchez,Logan Webb,0.6075,0.5705,PHI,,,,
+2026-04-29,BAL,HOU,Chris Bassitt,Peter Lambert,0.5105,0.5275,BAL,,,,
+2026-04-30,ATL,DET,Bryce Elder,Framber Valdez,0.4857,0.5373,DET,2.0,5.0,0.0,True
+2026-04-30,BAL,HOU,Chris Bassitt,Lance McCullers Jr.,0.5537,0.5311,BAL,10.0,3.0,1.0,False
+2026-04-30,BAL,HOU,Brandon Young,TBD,0.5534,0.5311,BAL,10.0,3.0,1.0,False
+2026-04-30,PIT,STL,Paul Skenes,Hunter Dobbins,0.6432,0.6646,PIT,5.0,10.0,0.0,False
+2026-04-30,PHI,SFG,Cristopher Sánchez,Logan Webb,0.6075,0.567,PHI,3.0,2.0,1.0,True
+2026-04-30,PHI,SFG,TBD,TBD,0.5943,0.567,PHI,3.0,2.0,1.0,True
+2026-04-30,CIN,COL,Andrew Abbott,Michael Lorenzen,0.5967,0.6066,CIN,6.0,4.0,1.0,True
+2026-04-30,NYM,WSN,Freddy Peralta,Miles Mikolas,0.6828,0.6515,NYM,4.0,5.0,0.0,False
+2026-04-30,MIL,ARI,Brandon Woodruff,Michael Soroka,0.5861,0.5325,MIL,13.0,1.0,1.0,True
+2026-04-30,OAK,KCR,Jeffrey Springs,Noah Cameron,0.5921,0.5339,OAK,6.0,3.0,1.0,True
+2026-04-30,MIN,TOR,Bailey Ober,Kevin Gausman,0.45,0.4473,TOR,,,,
+2026-05-01,CHC,ARI,Colin Rea,Zac Gallen,0.5534,0.5535,CHC,,,,
+2026-05-01,DET,TEX,Jack Flaherty,MacKenzie Gore,0.5567,0.5167,DET,,,,
+2026-05-01,PIT,CIN,Mitch Keller,Brady Singer,0.5211,0.5407,PIT,,,,
+2026-05-01,WSN,MIL,Jake Irvin,Jacob Misiorowski,0.3322,0.4111,MIL,,,,
+2026-05-01,NYY,BAL,Will Warren,TBD,0.5967,0.6068,NYY,,,,
+2026-05-01,BOS,HOU,TBD,Mike Burrows,0.4965,0.5,HOU,,,,
+2026-05-01,TBR,SFG,Shane McClanahan,Robbie Ray,0.5338,0.5502,TBR,,,,
+2026-05-01,MIA,PHI,Eury Pérez,Zack Wheeler,0.4345,0.4593,PHI,,,,
+2026-05-01,MIN,TOR,Simeon Woods Richardson,Patrick Corbin,0.5653,0.5066,MIN,,,,
+2026-05-01,STL,LAD,Matthew Liberatore,Emmet Sheehan,0.3187,0.3798,LAD,,,,
+2026-05-01,COL,ATL,Jose Quintana,Grant Holmes,0.3915,0.363,ATL,,,,
+2026-05-01,LAA,NYM,Walbert Urena,Christian Scott,0.5534,0.4627,LAA,,,,
+2026-05-01,OAK,CLE,J.T. Ginn,Joey Cantillo,0.557,0.5124,OAK,,,,
+2026-05-01,SDP,CHW,Germán Márquez,Noah Schultz,0.3322,0.5669,CHW,,,,
+2026-05-01,SEA,KCR,Bryan Woo,Cole Ragans,0.5567,0.5838,SEA,,,,

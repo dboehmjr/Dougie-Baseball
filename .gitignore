@@ -1,0 +1,63 @@
+# Large data files (reproducible — run the pipeline to regenerate)
+data/features.csv
+data/game_logs_raw.csv
+data/pitcher_game_logs.csv
+data/umpire_game_logs.csv
+data/pitcher_stats.csv
+data/batting_stats.csv
+data/game_sp.csv
+data/weather.csv
+data/backtest_historical_results.csv
+
+# Model artifact (also reproducible)
+models/win_prob_model.pkl
+
+# Keep these smaller/live data files
+!data/game_logs_live.csv
+!data/transactions_live.csv
+!data/team_splits.csv
+!data/il_counts.csv
+!data/il_quality.csv
+!data/player_war.csv
+!data/pitcher_stuff.csv
+!data/statcast_batting.csv
+!data/historical_odds.csv
+!data/action_network_odds.csv
+!data/action_network_odds_2026.csv
+!data/backtest_2025_results.csv
+!data/backtest_2026_results.csv
+!data/backtest_2026.csv
+!data/odds_cache.csv
+!data/kelly_tracker.csv
+!data/bankroll_ledger.csv
+!data/predictions_log.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Environment / secrets
+.env
+*.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Plots (generated, not source)
+plots/
