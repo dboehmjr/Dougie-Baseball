@@ -775,7 +775,8 @@ with tab1:
                 p_home = get_prediction(home, away, year, date_str,
                                         home_sp=g.get("home_sp", ""),
                                         away_sp=g.get("away_sp", ""))
-            except Exception:
+            except Exception as _pred_err:
+                st.warning(f"Prediction failed for {away}@{home}: {_pred_err}")
                 continue
 
             p_away  = 1 - p_home
