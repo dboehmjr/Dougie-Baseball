@@ -226,19 +226,24 @@ def get_sp_stats(name: str, team: str, year: int, stuff_df: pd.DataFrame) -> dic
 
 
 def get_weather_for_game(home_team: str, game_date: str, weather_df: pd.DataFrame) -> dict:
-    if weather_df.empty:
+    if not weather_df.empty:
+        mask = (weather_df["home_team"] == home_team) & (weather_df["date"].astype(str).str[:10] == game_date[:10])
+        row = weather_df[mask]
+        if not row.empty:
+            r = row.iloc[0]
+            return {
+                "temp_f":        float(r["temp_f"]) if pd.notna(r.get("temp_f")) else None,
+                "wind_speed_mph": float(r["wind_speed_mph"]) if pd.notna(r.get("wind_speed_mph")) else None,
+                "wind_dir_deg":  float(r["wind_dir_deg"]) if pd.notna(r.get("wind_dir_deg")) else None,
+                "humidity_pct":  float(r["humidity_pct"]) if pd.notna(r.get("humidity_pct")) else None,
+            }
+    # Fall back to live forecast API for today/upcoming games not yet in cache
+    try:
+        from fetch_weather import get_game_weather
+        wx = get_game_weather(home_team, game_date, weather_df)
+        return wx if wx else {}
+    except Exception:
         return {}
-    mask = (weather_df["home_team"] == home_team) & (weather_df["date"].astype(str).str[:10] == game_date[:10])
-    row = weather_df[mask]
-    if row.empty:
-        return {}
-    r = row.iloc[0]
-    return {
-        "temp_f":        float(r["temp_f"]) if pd.notna(r.get("temp_f")) else None,
-        "wind_speed_mph": float(r["wind_speed_mph"]) if pd.notna(r.get("wind_speed_mph")) else None,
-        "wind_dir_deg":  float(r["wind_dir_deg"]) if pd.notna(r.get("wind_dir_deg")) else None,
-        "humidity_pct":  float(r["humidity_pct"]) if pd.notna(r.get("humidity_pct")) else None,
-    }
 
 
 def generate_key_factors(r: dict, home_stuff: dict, away_stuff: dict,
@@ -611,12 +616,32 @@ def refresh_all_pending(ledger: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
 
 @st.cache_data(ttl=3600)
+def _update_streak_from_live(team: str, last_features_date: pd.Timestamp,
+                              last_streak: float, live_logs) -> float:
+    """Replay game_logs_live results on/after last_features_date to get current streak."""
+    if live_logs is None or live_logs.empty:
+        return last_streak
+    newer = live_logs[live_logs["Date"] >= last_features_date].sort_values("Date")
+    team_games = newer[(newer["home_team"] == team) | (newer["away_team"] == team)]
+    streak = last_streak
+    for _, row in team_games.iterrows():
+        is_home = row["home_team"] == team
+        won = (row["home_win"] == 1) if is_home else (row["home_win"] == 0)
+        streak = (streak + 1) if won and streak > 0 else (1 if won else
+                  (streak - 1) if not won and streak < 0 else -1)
+    return streak
+
+
 def load_team_form() -> dict[str, dict]:
     """Return latest hot/cold stats per team from features.csv."""
     features_path = os.path.join(DATA_DIR, "features.csv")
     if not os.path.exists(features_path):
         return {}
     df = pd.read_csv(features_path, parse_dates=["Date"])
+
+    live_logs_path = os.path.join(DATA_DIR, "game_logs_live.csv")
+    live_logs = pd.read_csv(live_logs_path, parse_dates=["Date"]) if os.path.exists(live_logs_path) else None
+
     form = {}
     teams = set(df["home_team"].unique()) | set(df["away_team"].unique())
     for team in teams:
@@ -628,12 +653,15 @@ def load_team_form() -> dict[str, dict]:
         prefix = "home" if last["home_team"] == team else "away"
         rd15   = last.get(f"{prefix}_rolling_rd", np.nan)
         rd7    = last.get(f"{prefix}_last7_rd",   np.nan)
-        streak = last.get(f"{prefix}_streak",     0)
+        raw_streak = last.get(f"{prefix}_streak", 0)
+        streak = _update_streak_from_live(team, pd.Timestamp(last["Date"]),
+                                          float(raw_streak) if pd.notna(raw_streak) else 0.0,
+                                          live_logs)
         momentum = (rd7 - rd15) if (pd.notna(rd7) and pd.notna(rd15)) else np.nan
         form[team] = {
             "rd15":     rd15,
             "rd7":      rd7,
-            "streak":   int(streak) if pd.notna(streak) else 0,
+            "streak":   int(streak),
             "momentum": momentum,
         }
     return form
