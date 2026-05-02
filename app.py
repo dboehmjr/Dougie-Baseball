@@ -727,8 +727,10 @@ with tab1:
     with col_left:
         slate_date = st.date_input("Date", value=date.today(), key="slate_date")
     with col_right:
+        _ledger_default = load_ledger()
+        _default_bk = float(_ledger_default["bankroll"].iloc[-1]) if not _ledger_default.empty else STARTING_BANKROLL
         bankroll_slate = st.number_input(
-            "Bankroll ($)", min_value=10.0, value=100.0, step=10.0, key="bk_slate"
+            "Bankroll ($)", min_value=10.0, value=_default_bk, step=10.0, key="bk_slate"
         )
         kelly_frac_pct = st.slider(
             "Kelly fraction", 10, 50, 25, 5, key="kf_slate", format="%d%%"
