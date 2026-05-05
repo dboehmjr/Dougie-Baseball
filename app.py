@@ -26,6 +26,7 @@ from predict import predict_matchup
 from fetch_odds import load_or_fetch_odds, get_home_implied_prob, get_moneyline_str
 from fetch_lineups import fetch_confirmed_lineups
 from fetch_weather import wind_to_cf, FULL_DOME
+from betting_strategy import choose_bet, load_policy
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -47,7 +48,9 @@ MLB_API_MAP = {
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 LEDGER_PATH = os.path.join(DATA_DIR, "bankroll_ledger.csv")
+BETTING_POLICY_PATH = os.path.join(MODELS_DIR, "betting_policy.json")
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +73,11 @@ def confidence_color(conf: float) -> str:
     if conf >= 0.58:
         return "🟡"
     return "⚪"
+
+
+@st.cache_data(ttl=300)
+def load_betting_policy():
+    return load_policy(BETTING_POLICY_PATH)
 
 
 @st.cache_data(ttl=60)
@@ -733,7 +741,7 @@ with tab1:
             "Bankroll ($)", min_value=10.0, value=_default_bk, step=10.0, key="bk_slate"
         )
         kelly_frac_pct = st.slider(
-            "Kelly fraction", 10, 50, 25, 5, key="kf_slate", format="%d%%"
+            "Kelly fraction", 5, 50, 25, 5, key="kf_slate", format="%d%%"
         )
         kelly_frac_slate = kelly_frac_pct / 100
         min_conf_pct = st.slider(
@@ -761,6 +769,7 @@ with tab1:
     lineups_df   = load_lineups_for_date(date_str)
     weather_df   = load_weather_data()
     has_odds     = not odds_df.empty
+    betting_policy = load_betting_policy()
 
     if not schedule:
         st.info("No games found for this date.")
@@ -788,7 +797,7 @@ with tab1:
             pick_odds = -110
             home_ml = away_ml = -110
             vegas_p_home = vegas_p_away = np.nan
-            MIN_EDGE = 0.03
+            odds_are_valid = False
             if not odds_df.empty:
                 orow = odds_df[(odds_df["home_team"] == home) & (odds_df["away_team"] == away)]
                 if not orow.empty:
@@ -802,24 +811,34 @@ with tab1:
                         t = imp_sum
                         vegas_p_home = _imp(home_ml) / t
                         vegas_p_away = _imp(away_ml) / t
+                        odds_are_valid = True
 
-            # Determine which side has edge.
-            # Require the model to also agree directionally (model prob > 50%)
-            # so we never bet an underdog solely because the model underestimates
-            # the other side's dominance.
-            edge_home = p_home - vegas_p_home if not np.isnan(vegas_p_home) else p_home - 0.5
-            edge_away = p_away - vegas_p_away if not np.isnan(vegas_p_away) else p_away - 0.5
-
-            if edge_home >= edge_away and edge_home > MIN_EDGE and p_home > 0.50:
-                bet_side = home; bet_p = p_home; pick_odds = home_ml; bet_edge = edge_home
-            elif edge_away > edge_home and edge_away > MIN_EDGE and p_away > 0.50:
-                bet_side = away; bet_p = p_away; pick_odds = away_ml; bet_edge = edge_away
+            if odds_are_valid:
+                pick = choose_bet(
+                    home=home, away=away, p_home=p_home,
+                    home_ml=home_ml, away_ml=away_ml, vegas_home=vegas_p_home,
+                    policy=betting_policy, game_date=date_str,
+                )
+                bet_side = pick["side"]
+                bet_p = pick["model_prob"]
+                pick_odds = pick["odds"]
+                bet_edge = pick["edge"]
+                has_edge = bool(pick["should_bet"])
+                odds_bucket = pick["odds_bucket"]
+                season_phase = pick["season_phase"]
+                policy_reason = pick["policy_reason"]
             else:
                 bet_side = home if p_home > p_away else away
-                bet_p = conf; pick_odds = home_ml if bet_side == home else away_ml; bet_edge = 0.0
+                bet_p = conf
+                pick_odds = home_ml if bet_side == home else away_ml
+                bet_edge = np.nan
+                has_edge = False
+                odds_bucket = None
+                season_phase = None
+                policy_reason = "missing odds"
 
             stake = kelly_stake(bet_p, bankroll_slate, kelly_frac_slate, ml=pick_odds) \
-                    if bet_edge > MIN_EDGE else 0.0
+                    if has_edge else 0.0
 
             if pick_odds > 0:
                 to_win = round(stake + stake * pick_odds / 100, 2)
@@ -890,12 +909,15 @@ with tab1:
                 "result":     result_str,
                 "won":        won,
                 "pnl":        pnl,
-                "has_edge":   bet_edge > MIN_EDGE,
+                "has_edge":   has_edge,
                 "home":       home,
                 "away":       away,
                 "vegas_prob":    vegas_prob,
                 "ml_str":        ml_str,
                 "model_edge":    model_edge,
+                "odds_bucket":   odds_bucket,
+                "season_phase":  season_phase,
+                "policy_reason": policy_reason,
                 "lineup_status": lineup_status,
                 "pick_odds":     pick_odds,
                 "home_score":    home_score,
@@ -951,6 +973,7 @@ with tab1:
                 row["Vegas Pick%"] = f"{vegas_pick_prob:.1%}"
                 edge = r["model_edge"]
                 row["Edge"] = f"{edge:+.1%}" if not np.isnan(edge) else "—"
+                row["Bucket"] = r.get("odds_bucket") or "—"
             if has_finals:
                 row["Result"] = r["result"] if r["result"] else "Pending"
                 row["P&L"]    = f"${r['pnl']:+.2f}" if r["pnl"] is not None else "—"
@@ -963,7 +986,8 @@ with tab1:
             st.caption(
                 f"🟢 ≥65% confidence  🟡 58–65%  ⚪ 53–58%  |  "
                 f"🔥 heating up  ❄️ cooling down  |  "
-                f"Break-even at -110: {BREAKEVEN:.1%}  |  Kelly fraction: {kelly_frac_slate:.0%}"
+                f"Break-even at -110: {BREAKEVEN:.1%}  |  Kelly fraction: {kelly_frac_slate:.0%}  |  "
+                f"Bet policy: {betting_policy.name}"
                 + odds_note
             )
 
@@ -1063,7 +1087,8 @@ with tab1:
                     st.markdown(
                         f"Model: `{r['away']} {ap:.1%}` vs `{r['home']} {hp:.1%}`  \n"
                         + (f"Vegas:  `{r['away']} {1-vp:.1%}` vs `{r['home']} {vp:.1%}`  \n" if not np.isnan(vp) else "")
-                        + (f"Edge on **{r['pick']}**: `{r['model_edge']:+.1%}`" if not np.isnan(r.get("model_edge") or np.nan) else "")
+                        + (f"Edge on **{r['pick']}**: `{r['model_edge']:+.1%}`  \n" if not np.isnan(r.get("model_edge") or np.nan) else "")
+                        + f"Policy: `{r.get('policy_reason', 'n/a')}`"
                     )
 
         # ── Roster moves (last 7 days) for today's teams ──────────
@@ -1150,11 +1175,61 @@ with tab3:
         m5.metric("ROI", f"{roi:+.1f}%")
         m6.metric("Pending", f"{len(pending)} bets")
 
-        # ── Editable bet history ───────────────────────────────
+        # ── Date filter ───────────────────────────────────────
         st.markdown("#### Bet History")
+        today = pd.Timestamp.today().normalize()
+        filter_options = ["All Time", "Today", "Yesterday", "Last 7 Days", "Last 30 Days",
+                          "This Month", "This Year", "Custom Range"]
+        fc1, fc2 = st.columns([2, 3])
+        with fc1:
+            period = st.selectbox("Filter by period", filter_options, index=0, key="ledger_period")
+        custom_start = custom_end = None
+        if period == "Custom Range":
+            with fc2:
+                cr1, cr2 = st.columns(2)
+                with cr1:
+                    custom_start = st.date_input("From", value=today - pd.Timedelta(days=30), key="cr_start")
+                with cr2:
+                    custom_end = st.date_input("To", value=today, key="cr_end")
+
+        def _filter_ledger(df: pd.DataFrame) -> pd.DataFrame:
+            if df.empty:
+                return df
+            dates = pd.to_datetime(df["date"]).dt.normalize()
+            if period == "Yesterday":
+                mask = dates == today - pd.Timedelta(days=1)
+            elif period == "Last 7 Days":
+                mask = dates >= today - pd.Timedelta(days=6)
+            elif period == "Last 30 Days":
+                mask = dates >= today - pd.Timedelta(days=29)
+            elif period == "This Month":
+                mask = (dates.dt.year == today.year) & (dates.dt.month == today.month)
+            elif period == "This Year":
+                mask = dates.dt.year == today.year
+            elif period == "Custom Range" and custom_start and custom_end:
+                mask = (dates >= pd.Timestamp(custom_start)) & (dates <= pd.Timestamp(custom_end))
+            else:
+                return df
+            return df[mask].copy()
+
+        filtered_ledger = _filter_ledger(ledger)
+
+        if period != "All Time":
+            fc = filtered_ledger[filtered_ledger["won"].notna()]
+            p_wins   = int(fc["won"].sum()) if not fc.empty else 0
+            p_losses = len(fc) - p_wins
+            p_pnl    = filtered_ledger["pnl"].sum()
+            p_staked = filtered_ledger["stake"].sum()
+            p_roi    = p_pnl / p_staked * 100 if p_staked > 0 else 0
+            p_pend   = filtered_ledger["won"].isna().sum()
+            st.caption(
+                f"**{period}:** {p_wins}W–{p_losses}L  |  "
+                f"Staked ${p_staked:.2f}  |  P&L ${p_pnl:+.2f}  |  ROI {p_roi:+.1f}%  |  {p_pend} pending"
+            )
+
         st.caption("Odds column uses American format (e.g. -110, +130). P&L updates when you click Save Changes.")
 
-        edit_df = ledger.copy()
+        edit_df = filtered_ledger.copy() if period != "All Time" else ledger.copy()
         edit_df["date"] = edit_df["date"].dt.strftime("%Y-%m-%d")
         edit_df["Result"] = edit_df["won"].map(
             {True: "✅ Win", False: "❌ Loss", None: "⏳ Pending"}

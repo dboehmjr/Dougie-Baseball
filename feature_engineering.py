@@ -258,24 +258,35 @@ def add_rolling_stats(games: pd.DataFrame, window: int = 15) -> pd.DataFrame:
     tg["streak"] = grp["_streak_after"].transform(lambda s: s.shift(1).fillna(0))
     tg = tg.drop(columns=["_streak_after"])
 
-    def merge_side(side_col, rd_col, rs_col, rd7_col, streak_col):
+    # Current-season running win% (shift-1, reset each calendar year)
+    # Captures teams that are genuinely bad *this* season, not just last year.
+    tg["win"] = (tg["run_diff"] > 0).astype(float)
+    tg["_year"] = tg["Date"].dt.year
+    tg["season_win_pct"] = (
+        tg.groupby(["team", "_year"])["win"]
+        .transform(lambda s: s.shift(1).expanding(min_periods=10).mean())
+    )
+    tg = tg.drop(columns=["win", "_year"])
+
+    def merge_side(side_col, rd_col, rs_col, rd7_col, streak_col, swp_col):
         side = tg.merge(
             games[["Date", side_col]],
             left_on=["Date", "team"], right_on=["Date", side_col],
             how="inner"
         )[[side_col, "Date", "rolling_run_diff", "rolling_runs_scored",
-           "last7_run_diff", "streak"]].rename(columns={
+           "last7_run_diff", "streak", "season_win_pct"]].rename(columns={
             "rolling_run_diff":    rd_col,
             "rolling_runs_scored": rs_col,
             "last7_run_diff":      rd7_col,
             "streak":              streak_col,
+            "season_win_pct":      swp_col,
         }).drop_duplicates(["Date", side_col])
         return side
 
     home_stats = merge_side("home_team", "home_rolling_rd", "home_rolling_rs",
-                             "home_last7_rd", "home_streak")
+                             "home_last7_rd", "home_streak", "home_season_win_pct")
     away_stats = merge_side("away_team", "away_rolling_rd", "away_rolling_rs",
-                             "away_last7_rd", "away_streak")
+                             "away_last7_rd", "away_streak", "away_season_win_pct")
 
     games = games.merge(home_stats, on=["Date", "home_team"], how="left")
     games = games.merge(away_stats, on=["Date", "away_team"], how="left")
@@ -459,8 +470,9 @@ def attach_sp_era(games: pd.DataFrame,
                   pitcher_era: pd.DataFrame,
                   team_era_fallback: pd.DataFrame) -> pd.DataFrame:
     """
-    Join Retrosheet SP assignments to each game, look up raw + park-adjusted ERA.
-    Falls back to team ERA when SP name is not found.
+    Join Retrosheet SP assignments to each game, then look up prior-season raw
+    and park-adjusted ERA. Falls back to prior-season team ERA when SP name is
+    not found.
     """
     gs = game_sp.copy()
     gs["home_sp_norm"] = gs["home_sp_name"].apply(_normalize_sp_name)
@@ -479,7 +491,7 @@ def attach_sp_era(games: pd.DataFrame,
         year = row.get("year")
         if pd.isna(name) or pd.isna(year):
             return np.nan
-        return lookup_series.get((name, int(year)), np.nan)
+        return lookup_series.get((name, int(year) - 1), np.nan)
 
     games["home_sp_era"]     = games.apply(lookup, sp_col="home_sp_norm", lookup_series=era_raw, axis=1)
     games["away_sp_era"]     = games.apply(lookup, sp_col="away_sp_norm", lookup_series=era_raw, axis=1)
@@ -488,6 +500,7 @@ def attach_sp_era(games: pd.DataFrame,
 
     # Fallback to team ERA
     fb = team_era_fallback.copy()
+    fb["year"] = fb["year"] + 1
     games = games.merge(
         fb.rename(columns={"team": "home_team", "team_era": "home_team_era",
                             "team_era_adj": "home_team_era_adj"}),
@@ -507,7 +520,7 @@ def attach_sp_era(games: pd.DataFrame,
     sp_hit_rate = games["home_sp_era_adj"].notna().mean()
     name_match  = (~games["home_sp_norm"].isna() &
                    games.apply(lambda r: not np.isnan(
-                       era_adj.get((r["home_sp_norm"], int(r["year"]))
+                       era_adj.get((r["home_sp_norm"], int(r["year"]) - 1)
                                    if not pd.isna(r["home_sp_norm"]) else ("", 0),
                                    np.nan)), axis=1)).mean()
     print(f"  SP ERA coverage : {sp_hit_rate:.1%}")
@@ -572,9 +585,10 @@ def attach_park_factor(games: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # SP pitch stuff (FanGraphs) — fastball velocity, whiff rate, K%, xFIP
 #
-# Joined at the season level: for game in year Y, we use the SP's FanGraphs
-# stats from year Y.  Falls back to team median.  Throws (handedness) is stored
-# separately so predict.py can look up batting splits.
+# Joined at the prior-season level: for game in year Y, use the SP's FanGraphs
+# stats from year Y-1. Current-season rolling SP/bullpen features carry the
+# in-year signal without leaking future games. Throws is stored separately so
+# predict.py can look up batting splits.
 # ---------------------------------------------------------------------------
 
 def attach_sp_stuff(games: pd.DataFrame,
@@ -626,7 +640,7 @@ def attach_sp_stuff(games: pd.DataFrame,
 
     for side, sp_col, team_col in [("home", "home_sp_norm", "home_team"),
                                     ("away", "away_sp_norm", "away_team")]:
-        yr   = games["year"]
+        yr   = games["year"] - 1
         name = games[sp_col] if sp_col in games.columns else pd.Series([None]*len(games))
         team = games[team_col]
 
@@ -756,6 +770,54 @@ def _ra9(runs: float, outs: float) -> float:
     if outs < 1:
         return np.nan
     return (runs / outs) * 27.0   # 27 outs = 9 innings
+
+
+def compute_sp_workload(game_logs: pd.DataFrame,
+                         game_sp: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each game, compute the starting pitcher's:
+      - sp_days_rest  : days since their previous start (capped 0–10; NaN for debut)
+      - sp_outs_last  : outs recorded in their previous start (proxy for pitch count)
+
+    Both use shift-1 per pitcher so the current game is always excluded.
+    Joined back via game_sp pitcher IDs → returns one row per game with
+    home_sp_days_rest, away_sp_days_rest, home_sp_outs_last, away_sp_outs_last.
+    """
+    starters = game_logs[game_logs["is_starter"]].copy()
+    starters["game_date"] = pd.to_datetime(starters["game_date"])
+    starters = starters.sort_values(["pitcher_id", "game_date"])
+
+    grp = starters.groupby("pitcher_id")
+    starters["prev_start_date"] = grp["game_date"].transform(lambda s: s.shift(1))
+    starters["sp_outs_last"]    = grp["outs_recorded"].transform(lambda s: s.shift(1))
+    starters["sp_days_rest"]    = (
+        (starters["game_date"] - starters["prev_start_date"]).dt.days - 1
+    ).clip(0, 10)
+
+    gs = game_sp.copy()
+    gs["Date"] = pd.to_datetime(gs["Date"])
+
+    work = starters[["game_date", "pitcher_id", "sp_days_rest", "sp_outs_last"]]
+
+    result = gs.merge(
+        work.rename(columns={"game_date": "Date",
+                              "sp_days_rest": "home_sp_days_rest",
+                              "sp_outs_last": "home_sp_outs_last"}),
+        left_on=["Date", "home_sp_id"], right_on=["Date", "pitcher_id"], how="left"
+    ).drop(columns=["pitcher_id"])
+
+    result = result.merge(
+        work.rename(columns={"game_date": "Date",
+                              "sp_days_rest": "away_sp_days_rest",
+                              "sp_outs_last": "away_sp_outs_last"}),
+        left_on=["Date", "away_sp_id"], right_on=["Date", "pitcher_id"], how="left"
+    ).drop(columns=["pitcher_id"])
+
+    cov = result["home_sp_days_rest"].notna().mean()
+    print(f"  SP workload coverage: {cov:.1%}  (days rest + outs last start)")
+    return result[["Date", "home_team", "away_team",
+                   "home_sp_days_rest", "away_sp_days_rest",
+                   "home_sp_outs_last", "away_sp_outs_last"]]
 
 
 def compute_inseason_sp_era(game_logs: pd.DataFrame,
@@ -936,11 +998,15 @@ def attach_inseason_stats(games: pd.DataFrame,
                           game_logs: pd.DataFrame,
                           game_sp: pd.DataFrame,
                           park_factors: pd.DataFrame) -> pd.DataFrame:
-    """Attach in-season rolling SP ERA, bullpen ERA, and bullpen usage to games."""
+    """Attach in-season rolling SP ERA, bullpen ERA, bullpen usage, and SP workload to games."""
 
     # --- SP ERA ---
     sp_stats = compute_inseason_sp_era(game_logs, game_sp, park_factors)
     games = games.merge(sp_stats, on=["Date", "home_team", "away_team"], how="left")
+
+    # --- SP workload (days rest + outs last start) ---
+    sp_work = compute_sp_workload(game_logs, game_sp)
+    games = games.merge(sp_work, on=["Date", "home_team", "away_team"], how="left")
 
     # --- Bullpen ERA (quality) ---
     bp_era = compute_inseason_bullpen_era(game_logs, park_factors)
@@ -1097,6 +1163,160 @@ def attach_batting_quality(games: pd.DataFrame,
     cov = games["home_team_ops"].notna().mean()
     print(f"  Batting quality coverage: {cov:.1%}")
     return games
+
+
+def _weighted_split_ops(row: pd.Series) -> float:
+    pa_l = float(row.get("pa_vs_lhp", 0) or 0)
+    pa_r = float(row.get("pa_vs_rhp", 0) or 0)
+    ops_l = float(row.get("ops_vs_lhp", np.nan))
+    ops_r = float(row.get("ops_vs_rhp", np.nan))
+    total = pa_l + pa_r
+    if total > 0 and pd.notna(ops_l) and pd.notna(ops_r):
+        return (ops_l * pa_l + ops_r * pa_r) / total
+    return np.nanmean([ops_l, ops_r])
+
+
+def attach_batting_splits_vs_sp(games: pd.DataFrame,
+                                splits_df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Attach prior-season team OPS against the opposing starter's throwing hand.
+    For a game in year Y, use team split stats from Y-1 to avoid leakage.
+    """
+    split_cols = [
+        "home_batting_ops_vs_sp", "away_batting_ops_vs_sp",
+        "home_platoon_advantage", "away_platoon_advantage",
+        "home_opp_sp_is_lhp", "away_opp_sp_is_lhp",
+        "home_sp_is_lhp", "away_sp_is_lhp", "both_sp_same_hand",
+    ]
+    if splits_df is None or splits_df.empty:
+        for col in split_cols:
+            games[col] = np.nan
+        print("  Batting splits vs SP coverage: 0.0%  (team_splits.csv missing)")
+        return games
+
+    splits = splits_df.copy()
+    for col in ["ops_vs_lhp", "ops_vs_rhp", "pa_vs_lhp", "pa_vs_rhp"]:
+        splits[col] = pd.to_numeric(splits[col], errors="coerce")
+    splits["year"] = pd.to_numeric(splits["year"], errors="coerce").astype("Int64")
+    splits["overall_split_ops"] = splits.apply(_weighted_split_ops, axis=1)
+    split_lk = splits.set_index(["team", "year"]).to_dict("index")
+
+    def _ops_for(team: str, year: int, opp_hand: str | None) -> float:
+        row = split_lk.get((team, int(year) - 1))
+        if not row:
+            return np.nan
+        hand = str(opp_hand).strip().upper() if pd.notna(opp_hand) else ""
+        if hand == "L":
+            return float(row.get("ops_vs_lhp", np.nan))
+        if hand == "R":
+            return float(row.get("ops_vs_rhp", np.nan))
+        return float(row.get("overall_split_ops", np.nan))
+
+    games["home_batting_ops_vs_sp"] = [
+        _ops_for(team, year, hand)
+        for team, year, hand in zip(games["home_team"], games["year"], games.get("away_sp_throws"))
+    ]
+    games["away_batting_ops_vs_sp"] = [
+        _ops_for(team, year, hand)
+        for team, year, hand in zip(games["away_team"], games["year"], games.get("home_sp_throws"))
+    ]
+    games["home_platoon_advantage"] = games["home_batting_ops_vs_sp"] - games["home_team_ops"]
+    games["away_platoon_advantage"] = games["away_batting_ops_vs_sp"] - games["away_team_ops"]
+
+    home_known = games["home_sp_throws"].isin(["L", "R"])
+    away_known = games["away_sp_throws"].isin(["L", "R"])
+    games["home_opp_sp_is_lhp"] = np.where(
+        away_known, (games["away_sp_throws"] == "L").astype(float), np.nan
+    )
+    games["away_opp_sp_is_lhp"] = np.where(
+        home_known, (games["home_sp_throws"] == "L").astype(float), np.nan
+    )
+    games["home_sp_is_lhp"] = np.where(
+        home_known, (games["home_sp_throws"] == "L").astype(float), np.nan
+    )
+    games["away_sp_is_lhp"] = np.where(
+        away_known, (games["away_sp_throws"] == "L").astype(float), np.nan
+    )
+    known_hands = games["home_sp_throws"].isin(["L", "R"]) & games["away_sp_throws"].isin(["L", "R"])
+    games["both_sp_same_hand"] = np.where(
+        known_hands,
+        (games["home_sp_throws"] == games["away_sp_throws"]).astype(float),
+        np.nan,
+    )
+
+    cov = games["home_batting_ops_vs_sp"].notna().mean()
+    print(f"  Batting splits vs SP coverage: {cov:.1%}")
+    return games
+
+
+def attach_historical_lineups(games: pd.DataFrame,
+                              lineups_df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Attach archived starting-lineup split OPS from data/historical_lineups.csv.
+    These features are only trainable once enough seasons have been backfilled.
+    """
+    cols = [
+        "home_lineup_ops_vs_sp", "away_lineup_ops_vs_sp",
+        "lineup_ops_vs_sp_diff",
+        "home_lineup_known_batters", "away_lineup_known_batters",
+    ]
+    if lineups_df is None or lineups_df.empty:
+        for col in cols:
+            games[col] = np.nan
+        print("  Historical lineup coverage: 0.0%")
+        return games
+
+    lineup = lineups_df.copy()
+    lineup["game_date"] = pd.to_datetime(lineup["game_date"])
+    for col in [
+        "home_lineup_blend_ops_vs_lhp", "home_lineup_blend_ops_vs_rhp",
+        "away_lineup_blend_ops_vs_lhp", "away_lineup_blend_ops_vs_rhp",
+        "home_lineup_ops_vs_lhp", "home_lineup_ops_vs_rhp",
+        "away_lineup_ops_vs_lhp", "away_lineup_ops_vs_rhp",
+        "home_lineup_known_batters", "away_lineup_known_batters",
+    ]:
+        if col in lineup.columns:
+            lineup[col] = pd.to_numeric(lineup[col], errors="coerce")
+
+    keep = [
+        "game_date", "home_team", "away_team",
+        "home_lineup_blend_ops_vs_lhp", "home_lineup_blend_ops_vs_rhp",
+        "away_lineup_blend_ops_vs_lhp", "away_lineup_blend_ops_vs_rhp",
+        "home_lineup_ops_vs_lhp", "home_lineup_ops_vs_rhp",
+        "away_lineup_ops_vs_lhp", "away_lineup_ops_vs_rhp",
+        "home_lineup_known_batters", "away_lineup_known_batters",
+    ]
+    lineup = lineup[[c for c in keep if c in lineup.columns]].drop_duplicates(
+        ["game_date", "home_team", "away_team"], keep="last"
+    )
+
+    out = games.copy()
+    out["game_date"] = pd.to_datetime(out["Date"])
+    out = out.merge(lineup, on=["game_date", "home_team", "away_team"], how="left")
+
+    for side in ["home", "away"]:
+        for suffix in ["lhp", "rhp"]:
+            blend_col = f"{side}_lineup_blend_ops_vs_{suffix}"
+            prior_col = f"{side}_lineup_ops_vs_{suffix}"
+            if blend_col in out.columns:
+                out[prior_col] = out[blend_col].combine_first(out[prior_col])
+
+    out["home_lineup_ops_vs_sp"] = np.select(
+        [out["away_sp_throws"].eq("L"), out["away_sp_throws"].eq("R")],
+        [out["home_lineup_ops_vs_lhp"], out["home_lineup_ops_vs_rhp"]],
+        default=np.nan,
+    )
+    out["away_lineup_ops_vs_sp"] = np.select(
+        [out["home_sp_throws"].eq("L"), out["home_sp_throws"].eq("R")],
+        [out["away_lineup_ops_vs_lhp"], out["away_lineup_ops_vs_rhp"]],
+        default=np.nan,
+    )
+    out["lineup_ops_vs_sp_diff"] = out["home_lineup_ops_vs_sp"] - out["away_lineup_ops_vs_sp"]
+    out = out.drop(columns=["game_date"])
+
+    cov = out["home_lineup_ops_vs_sp"].notna().mean()
+    print(f"  Historical lineup coverage: {cov:.1%}")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1422,7 +1642,7 @@ FEATURE_COLS = [
     "home_streak",
     "away_streak",
     "streak_diff",
-    # Season-level park-adjusted SP ERA (full season fallback)
+    # Prior-season park-adjusted SP ERA (full-season fallback)
     "home_sp_era_adj",
     "away_sp_era_adj",
     "sp_era_adj_diff",
@@ -1452,10 +1672,38 @@ FEATURE_COLS = [
     "home_team_ops",
     "away_team_ops",
     "ops_diff",
+    # Prior-season team platoon quality against opposing SP hand
+    "home_batting_ops_vs_sp",
+    "away_batting_ops_vs_sp",
+    "batting_ops_vs_sp_diff",
+    "home_platoon_advantage",
+    "away_platoon_advantage",
+    "platoon_advantage_diff",
+    # Historical confirmed starting-lineup quality vs opposing SP hand
+    "home_lineup_ops_vs_sp",
+    "away_lineup_ops_vs_sp",
+    "lineup_ops_vs_sp_diff",
+    "home_lineup_known_batters",
+    "away_lineup_known_batters",
+    "lineup_known_batters_diff",
+    # Starting pitcher handedness context
+    "home_opp_sp_is_lhp",
+    "away_opp_sp_is_lhp",
+    "home_sp_is_lhp",
+    "away_sp_is_lhp",
+    "both_sp_same_hand",
     # Prior-season Pythagorean win% (stable team quality anchor)
     "home_prior_win_pct",
     "away_prior_win_pct",
     "prior_win_pct_diff",
+    # Current-season running win% + delta vs prior-year baseline
+    # Captures teams that are genuinely bad/good THIS season (e.g. late-season tankers)
+    "home_season_win_pct",
+    "away_season_win_pct",
+    "season_win_pct_diff",
+    "home_season_win_pct_delta",
+    "away_season_win_pct_delta",
+    "season_win_pct_delta_diff",
     # Game-time weather at home park
     "temp_f",
     "wind_speed_mph",
@@ -1477,7 +1725,7 @@ FEATURE_COLS = [
     "park_rf_dist",
     "park_lf_wall_ht",
     "park_altitude_ft",
-    # SP pitch stuff from FanGraphs (season-level, park-adjusted via xFIP)
+    # Prior-season SP pitch stuff from FanGraphs (park-adjusted via xFIP)
     "home_sp_fbv",
     "away_sp_fbv",
     "sp_fbv_diff",
@@ -1490,10 +1738,17 @@ FEATURE_COLS = [
     "home_sp_xfip",
     "away_sp_xfip",
     "sp_xfip_diff",
-    # SP sample size — PA batted in current season (low = stats less reliable)
+    # SP sample size — PA batted in prior season (low = stats less reliable)
     "home_sp_pa",
     "away_sp_pa",
     "sp_pa_diff",
+    # SP workload: days since last start + outs thrown in last start
+    "home_sp_days_rest",
+    "away_sp_days_rest",
+    "sp_days_rest_diff",
+    "home_sp_outs_last",
+    "away_sp_outs_last",
+    "sp_outs_last_diff",
     # Prior-season Statcast power metrics (barrel rate, hard hit%)
     "home_barrel_pct",
     "away_barrel_pct",
@@ -1501,17 +1756,9 @@ FEATURE_COLS = [
     "home_hard_hit_pct",
     "away_hard_hit_pct",
     "hard_hit_pct_diff",
-    # Prediction-time-only features (NaN in training; imputed to median)
-    # Vegas consensus moneyline (devigged home-win probability)
+    # Market-aware feature. This is kept in features.csv, but training builds
+    # separate market-independent and market-aware model artifacts.
     "vegas_home_prob",
-    # Confirmed lineup average OPS
-    "home_lineup_ops",
-    "away_lineup_ops",
-    "lineup_ops_diff",
-    # Batting splits vs SP handedness (OPS vs LHP / RHP)
-    "home_batting_ops_vs_sp",
-    "away_batting_ops_vs_sp",
-    "batting_ops_vs_sp_diff",
 ]
 
 TARGET_COL = "home_win"
@@ -1533,6 +1780,17 @@ def build_feature_matrix(games: pd.DataFrame) -> pd.DataFrame:
     games["bullpen_usage_diff"]        = games["away_bullpen_outs_3d"]      - games["home_bullpen_outs_3d"]
     games["ops_diff"]                  = games["home_team_ops"]             - games["away_team_ops"]
     games["prior_win_pct_diff"]        = games["home_prior_win_pct"]        - games["away_prior_win_pct"]
+    # Current-season win% delta vs prior-year baseline (negative = underperforming)
+    if "home_season_win_pct" in games.columns:
+        games["home_season_win_pct_delta"] = games["home_season_win_pct"] - games["home_prior_win_pct"]
+        games["away_season_win_pct_delta"] = games["away_season_win_pct"] - games["away_prior_win_pct"]
+        games["season_win_pct_diff"]       = games["home_season_win_pct"] - games["away_season_win_pct"]
+        games["season_win_pct_delta_diff"] = games["home_season_win_pct_delta"] - games["away_season_win_pct_delta"]
+    else:
+        for col in ["home_season_win_pct", "away_season_win_pct",
+                    "home_season_win_pct_delta", "away_season_win_pct_delta",
+                    "season_win_pct_diff", "season_win_pct_delta_diff"]:
+            games[col] = np.nan
     # SP stuff diffs (higher FBv/K%/SwStr% + lower xFIP favors home)
     if "home_sp_fbv" in games.columns:
         games["sp_fbv_diff"]   = games["home_sp_fbv"]   - games["away_sp_fbv"]
@@ -1551,13 +1809,33 @@ def build_feature_matrix(games: pd.DataFrame) -> pd.DataFrame:
         for col in ["home_il_war", "away_il_war", "il_war_diff"]:
             games[col] = np.nan
 
-    # Prediction-time-only (will be NaN in training data; imputed to median)
-    for col in ["vegas_home_prob", "home_lineup_ops", "away_lineup_ops",
-                "home_batting_ops_vs_sp", "away_batting_ops_vs_sp"]:
+    # SP workload diffs
+    if "home_sp_days_rest" in games.columns:
+        games["sp_days_rest_diff"] = games["home_sp_days_rest"] - games["away_sp_days_rest"]
+        games["sp_outs_last_diff"] = games["home_sp_outs_last"] - games["away_sp_outs_last"]
+    else:
+        for col in ["home_sp_days_rest", "away_sp_days_rest", "sp_days_rest_diff",
+                    "home_sp_outs_last", "away_sp_outs_last", "sp_outs_last_diff"]:
+            games[col] = np.nan
+
+    for col in ["vegas_home_prob", "home_lineup_ops", "away_lineup_ops"]:
         if col not in games.columns:
             games[col] = np.nan
     games["lineup_ops_diff"]          = games["home_lineup_ops"]          - games["away_lineup_ops"]
+    for col in ["home_lineup_ops_vs_sp", "away_lineup_ops_vs_sp",
+                "home_lineup_known_batters", "away_lineup_known_batters"]:
+        if col not in games.columns:
+            games[col] = np.nan
+    games["lineup_ops_vs_sp_diff"]    = games["home_lineup_ops_vs_sp"]    - games["away_lineup_ops_vs_sp"]
+    games["lineup_known_batters_diff"] = games["home_lineup_known_batters"] - games["away_lineup_known_batters"]
+    for col in ["home_batting_ops_vs_sp", "away_batting_ops_vs_sp",
+                "home_platoon_advantage", "away_platoon_advantage",
+                "home_opp_sp_is_lhp", "away_opp_sp_is_lhp",
+                "home_sp_is_lhp", "away_sp_is_lhp", "both_sp_same_hand"]:
+        if col not in games.columns:
+            games[col] = np.nan
     games["batting_ops_vs_sp_diff"]   = games["home_batting_ops_vs_sp"]   - games["away_batting_ops_vs_sp"]
+    games["platoon_advantage_diff"]   = games["home_platoon_advantage"]   - games["away_platoon_advantage"]
 
     available = [c for c in FEATURE_COLS if c in games.columns]
     missing = [c for c in FEATURE_COLS if c not in games.columns]
@@ -1566,7 +1844,8 @@ def build_feature_matrix(games: pd.DataFrame) -> pd.DataFrame:
         print(f"  WARNING: {len(missing)}/{len(FEATURE_COLS)} feature cols absent "
               f"({coverage_pct:.0f}% coverage): {missing[:10]}{'…' if len(missing) > 10 else ''}")
 
-    out = games[["Date", "year", "home_team", "away_team", TARGET_COL] + available].copy()
+    id_cols = ["Date", "year", "home_team", "away_team", "home_runs", "away_runs", TARGET_COL]
+    out = games[id_cols + available].copy()
     # Drop rows where either rolling_rd is NaN — these are early-season games
     # with < min_periods prior games and would bias training with noisy inputs.
     out = out.dropna(subset=["home_rolling_rd", "away_rolling_rd"], how="any")
@@ -1672,6 +1951,22 @@ if __name__ == "__main__":
 
     print("Attaching prior-season batting quality (team OPS)...")
     games = attach_batting_quality(games, batting_stats)
+
+    print("Attaching prior-season batting splits vs opposing SP hand...")
+    splits_path = os.path.join(DATA_DIR, "team_splits.csv")
+    if os.path.exists(splits_path):
+        splits_df = pd.read_csv(splits_path)
+        games = attach_batting_splits_vs_sp(games, splits_df)
+    else:
+        games = attach_batting_splits_vs_sp(games, None)
+
+    print("Attaching historical starting-lineup split OPS...")
+    lineups_path = os.path.join(DATA_DIR, "historical_lineups.csv")
+    if os.path.exists(lineups_path):
+        historical_lineups = pd.read_csv(lineups_path)
+        games = attach_historical_lineups(games, historical_lineups)
+    else:
+        games = attach_historical_lineups(games, None)
 
     print("Attaching prior-season Pythagorean win%...")
     games = attach_prior_win_pct(games)

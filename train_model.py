@@ -1,5 +1,5 @@
 """
-Train an XGBoost win-probability model with cross-validated hyperparameter search.
+Train XGBoost win-probability models with cross-validated hyperparameter search.
 
 XGBoost captures non-linear interactions (e.g. park_factor × SP ERA) that logistic
 regression cannot.  We use TimeSeriesSplit so validation folds always use past data
@@ -7,13 +7,13 @@ to predict future games — no leakage.
 
 Steps:
   1. Load features.csv
-  2. Time-based train/test split (2015-2023 train, 2024 test)
+  2. Time-based train/test split (2015-2024 train, 2025 test)
   3. Impute missing values
   4. RandomizedSearchCV over XGBoost hyperparameters using TimeSeriesSplit
-  5. Calibrate probabilities with isotonic regression
+  5. Calibrate probabilities with chronological isotonic regression
   6. Evaluate: accuracy, log loss, Brier score, ROC AUC, calibration curve
   7. Compare against logistic regression baseline
-  8. Save model to models/win_prob_model.pkl
+  8. Save market-independent and market-aware model artifacts
 """
 
 from __future__ import annotations
@@ -92,10 +92,37 @@ FEATURE_COLS = [
     "home_team_ops",
     "away_team_ops",
     "ops_diff",
+    # Prior-season platoon quality against opposing SP hand
+    "home_batting_ops_vs_sp",
+    "away_batting_ops_vs_sp",
+    "batting_ops_vs_sp_diff",
+    "home_platoon_advantage",
+    "away_platoon_advantage",
+    "platoon_advantage_diff",
+    # Historical confirmed starting-lineup quality vs opposing SP hand
+    "home_lineup_ops_vs_sp",
+    "away_lineup_ops_vs_sp",
+    "lineup_ops_vs_sp_diff",
+    "home_lineup_known_batters",
+    "away_lineup_known_batters",
+    "lineup_known_batters_diff",
+    # Starting pitcher handedness context
+    "home_opp_sp_is_lhp",
+    "away_opp_sp_is_lhp",
+    "home_sp_is_lhp",
+    "away_sp_is_lhp",
+    "both_sp_same_hand",
     # Prior-season Pythagorean win% (stable team quality anchor)
     "home_prior_win_pct",
     "away_prior_win_pct",
     "prior_win_pct_diff",
+    # Current-season running win% + delta vs prior-year baseline
+    "home_season_win_pct",
+    "away_season_win_pct",
+    "season_win_pct_diff",
+    "home_season_win_pct_delta",
+    "away_season_win_pct_delta",
+    "season_win_pct_delta_diff",
     # Game-time weather at home park
     "temp_f",
     "wind_speed_mph",
@@ -117,7 +144,7 @@ FEATURE_COLS = [
     "park_rf_dist",
     "park_lf_wall_ht",
     "park_altitude_ft",
-    # SP pitch stuff (FanGraphs season-level: velocity, whiff rate, K%, xFIP)
+    # SP pitch stuff (prior-season FanGraphs: velocity, whiff rate, K%, xFIP)
     "home_sp_fbv",
     "away_sp_fbv",
     "sp_fbv_diff",
@@ -130,10 +157,17 @@ FEATURE_COLS = [
     "home_sp_xfip",
     "away_sp_xfip",
     "sp_xfip_diff",
-    # SP sample size — PA batted in current season (low = stats less reliable)
+    # SP sample size — PA batted in prior season (low = stats less reliable)
     "home_sp_pa",
     "away_sp_pa",
     "sp_pa_diff",
+    # SP workload: days since last start + outs thrown in last start
+    "home_sp_days_rest",
+    "away_sp_days_rest",
+    "sp_days_rest_diff",
+    "home_sp_outs_last",
+    "away_sp_outs_last",
+    "sp_outs_last_diff",
     # Prior-season Statcast power metrics (barrel rate, hard hit%)
     "home_barrel_pct",
     "away_barrel_pct",
@@ -141,17 +175,13 @@ FEATURE_COLS = [
     "home_hard_hit_pct",
     "away_hard_hit_pct",
     "hard_hit_pct_diff",
-    # Prediction-time-only features (NaN in training; imputed to median by SimpleImputer)
-    # Vegas consensus moneyline probability (devigged)
+    # Market-aware feature. Excluded from the primary edge model.
     "vegas_home_prob",
-    # Confirmed lineup average OPS
-    "home_lineup_ops",
-    "away_lineup_ops",
-    "lineup_ops_diff",
-    # Batting OPS vs SP handedness (from L/R splits)
-    "home_batting_ops_vs_sp",
-    "away_batting_ops_vs_sp",
-    "batting_ops_vs_sp_diff",
+]
+
+MARKET_FEATURE_COLS = ["vegas_home_prob"]
+MARKET_INDEPENDENT_FEATURE_COLS = [
+    c for c in FEATURE_COLS if c not in MARKET_FEATURE_COLS
 ]
 
 TARGET_COL = "home_win"
@@ -190,7 +220,6 @@ def build_xgb_pipeline() -> Pipeline:
     xgb = XGBClassifier(
         objective="binary:logistic",
         eval_metric="logloss",
-        use_label_encoder=False,
         random_state=42,
         n_jobs=2,          # limit to 2 cores — prevents overheating
     )
@@ -198,6 +227,15 @@ def build_xgb_pipeline() -> Pipeline:
         ("imputer", SimpleImputer(strategy="median")),
         ("model",   xgb),
     ])
+
+
+def _calibrated_classifier(estimator, n_splits: int = 5) -> CalibratedClassifierCV:
+    """Build a chronological calibrator; sklearn renamed this arg in newer releases."""
+    cv = TimeSeriesSplit(n_splits=n_splits)
+    try:
+        return CalibratedClassifierCV(estimator=estimator, method="isotonic", cv=cv)
+    except TypeError:
+        return CalibratedClassifierCV(base_estimator=estimator, method="isotonic", cv=cv)
 
 
 def tune_and_fit(X_train: pd.DataFrame, y_train: pd.Series) -> Pipeline:
@@ -231,11 +269,7 @@ def tune_and_fit(X_train: pd.DataFrame, y_train: pd.Series) -> Pipeline:
 
     # Calibrate the best estimator with isotonic regression
     best = search.best_estimator_
-    calibrated = CalibratedClassifierCV(
-        base_estimator=best,
-        method="isotonic",
-        cv=5,
-    )
+    calibrated = _calibrated_classifier(best)
     print("\nCalibrating probabilities...")
     calibrated.fit(X_train, y_train)
 
@@ -250,9 +284,8 @@ def build_lr_baseline() -> Pipeline:
     return Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler",  StandardScaler()),
-        ("model",   CalibratedClassifierCV(
-            base_estimator=LogisticRegression(max_iter=1000, C=1.0, random_state=42),
-            method="sigmoid", cv=5,
+        ("model",   _calibrated_classifier(
+            LogisticRegression(max_iter=1000, C=1.0, random_state=42),
         )),
     ])
 
@@ -279,7 +312,7 @@ def compute_metrics(name: str, model, X_test, y_test) -> dict:
 
 
 def plot_evaluation(metrics_xgb: dict, metrics_lr: dict,
-                    y_test: pd.Series) -> None:
+                    y_test: pd.Series, suffix: str = "") -> None:
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
     # Calibration curves
@@ -302,15 +335,22 @@ def plot_evaluation(metrics_xgb: dict, metrics_lr: dict,
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    fig.savefig(os.path.join(PLOTS_DIR, "evaluation.png"), dpi=150)
+    out_name = f"evaluation{suffix}.png"
+    fig.savefig(os.path.join(PLOTS_DIR, out_name), dpi=150)
     plt.close()
-    print("\nPlots saved to plots/evaluation.png")
+    print(f"\nPlots saved to plots/{out_name}")
 
 
-def plot_feature_importance(model, feature_cols: list[str]) -> None:
+def _get_base_estimator(calibrated_model):
+    clf = calibrated_model.calibrated_classifiers_[0]
+    return getattr(clf, "estimator", getattr(clf, "base_estimator", None))
+
+
+def plot_feature_importance(model, feature_cols: list[str], suffix: str = "") -> None:
     try:
         # Pull importance from one of the calibrated XGB estimators
-        xgb_clf = model.calibrated_classifiers_[0].base_estimator.named_steps["model"]
+        base = _get_base_estimator(model)
+        xgb_clf = base.named_steps["model"]
         importance = xgb_clf.feature_importances_
         n = min(len(importance), len(feature_cols))
         imp_df = pd.DataFrame({
@@ -324,9 +364,10 @@ def plot_feature_importance(model, feature_cols: list[str]) -> None:
         ax.set_title("XGBoost Feature Importance")
         ax.grid(True, axis="x", alpha=0.3)
         plt.tight_layout()
-        fig.savefig(os.path.join(PLOTS_DIR, "feature_importance.png"), dpi=150)
+        out_name = f"feature_importance{suffix}.png"
+        fig.savefig(os.path.join(PLOTS_DIR, out_name), dpi=150)
         plt.close()
-        print("Feature importance plot saved to plots/feature_importance.png")
+        print(f"Feature importance plot saved to plots/{out_name}")
 
         print("\nFeature importances:")
         for _, row in imp_df.sort_values("importance", ascending=False).iterrows():
@@ -344,32 +385,62 @@ if __name__ == "__main__":
     print(f"Loading features from {features_path}")
     train, test = load_and_split(features_path)
 
-    available = [c for c in FEATURE_COLS if c in train.columns]
+    available_all = [c for c in FEATURE_COLS if c in train.columns]
     missing = [c for c in FEATURE_COLS if c not in train.columns]
-    coverage_pct = len(available) / len(FEATURE_COLS) * 100
-    print(f"Features: {len(available)}/{len(FEATURE_COLS)} ({coverage_pct:.0f}% coverage)")
+    coverage_pct = len(available_all) / len(FEATURE_COLS) * 100
+    print(f"Features: {len(available_all)}/{len(FEATURE_COLS)} ({coverage_pct:.0f}% coverage)")
     if missing:
         print(f"  Missing features: {missing}")
     print(f"Train: {len(train):,} games | Test: {len(test):,} games")
 
-    X_train, y_train = train[available], train[TARGET_COL]
-    X_test,  y_test  = test[available],  test[TARGET_COL]
+    y_train = train[TARGET_COL]
+    y_test  = test[TARGET_COL]
 
-    # --- XGBoost ---
-    xgb_model = tune_and_fit(X_train, y_train)
-    metrics_xgb = compute_metrics("XGBoost (tuned + calibrated)", xgb_model, X_test, y_test)
+    specs = [
+        {
+            "name": "market_independent",
+            "label": "Market-independent",
+            "features": [c for c in MARKET_INDEPENDENT_FEATURE_COLS if c in train.columns],
+            "path": os.path.join(MODEL_DIR, "win_prob_model.pkl"),
+            "suffix": "",
+        },
+        {
+            "name": "market_aware",
+            "label": "Market-aware",
+            "features": [c for c in FEATURE_COLS if c in train.columns],
+            "path": os.path.join(MODEL_DIR, "win_prob_market_model.pkl"),
+            "suffix": "_market",
+        },
+    ]
 
-    # --- Logistic regression baseline ---
-    print("\nFitting logistic regression baseline...")
-    lr_model = build_lr_baseline()
-    lr_model.fit(X_train, y_train)
-    metrics_lr = compute_metrics("Logistic Regression (baseline)", lr_model, X_test, y_test)
+    for spec in specs:
+        feat_cols = spec["features"]
+        print(f"\n--- Training {spec['label']} model ({len(feat_cols)} features) ---")
+        X_train = train[feat_cols]
+        X_test  = test[feat_cols]
 
-    # --- Plots ---
-    plot_evaluation(metrics_xgb, metrics_lr, y_test)
-    plot_feature_importance(xgb_model, available)
+        xgb_model = tune_and_fit(X_train, y_train)
+        metrics_xgb = compute_metrics(
+            f"XGBoost ({spec['label']}, tuned + calibrated)",
+            xgb_model, X_test, y_test,
+        )
 
-    # --- Save XGBoost as primary model ---
-    model_path = os.path.join(MODEL_DIR, "win_prob_model.pkl")
-    joblib.dump({"pipeline": xgb_model, "features": available}, model_path)
-    print(f"\nXGBoost model saved to {model_path}")
+        print("\nFitting logistic regression baseline...")
+        lr_model = build_lr_baseline()
+        lr_model.fit(X_train, y_train)
+        metrics_lr = compute_metrics(
+            f"Logistic Regression ({spec['label']} baseline)",
+            lr_model, X_test, y_test,
+        )
+
+        plot_evaluation(metrics_xgb, metrics_lr, y_test, suffix=spec["suffix"])
+        plot_feature_importance(xgb_model, feat_cols, suffix=spec["suffix"])
+
+        joblib.dump({
+            "pipeline": xgb_model,
+            "features": feat_cols,
+            "model_type": spec["name"],
+            "uses_market": "vegas_home_prob" in feat_cols,
+            "target": TARGET_COL,
+        }, spec["path"])
+        print(f"\n{spec['label']} XGBoost model saved to {spec['path']}")

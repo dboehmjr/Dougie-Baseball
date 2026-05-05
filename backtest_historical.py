@@ -16,6 +16,7 @@ import pandas as pd
 
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.impute import SimpleImputer
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from xgboost import XGBClassifier
 
@@ -38,7 +39,6 @@ XGB_PARAMS = {
     "gamma":            0.1,
     "objective":        "binary:logistic",
     "eval_metric":      "logloss",
-    "use_label_encoder": False,
     "random_state":     42,
     "n_jobs":           2,
 }
@@ -90,7 +90,11 @@ def train_for_year(feat_df: pd.DataFrame, target_year: int,
         ("imputer", SimpleImputer(strategy="median")),
         ("model",   XGBClassifier(**XGB_PARAMS)),
     ])
-    calibrated = CalibratedClassifierCV(base_estimator=pipeline, method="isotonic", cv=3)
+    cv = TimeSeriesSplit(n_splits=3)
+    try:
+        calibrated = CalibratedClassifierCV(pipeline, method="isotonic", cv=cv)
+    except TypeError:
+        calibrated = CalibratedClassifierCV(base_estimator=pipeline, method="isotonic", cv=cv)
     calibrated.fit(X, y)
     return calibrated
 
@@ -110,10 +114,7 @@ def run_backtest() -> pd.DataFrame:
     odds_df["year"] = odds_df["date"].dt.year
 
     saved = joblib.load(os.path.join(MODEL_DIR, "win_prob_model.pkl"))
-    # Exclude prediction-time-only features not in features.csv
-    SKIP = {"vegas_home_prob", "home_lineup_ops", "away_lineup_ops", "lineup_ops_diff",
-            "home_batting_ops_vs_sp", "away_batting_ops_vs_sp", "batting_ops_vs_sp_diff"}
-    static_features = [c for c in saved["features"] if c in feat_df.columns and c not in SKIP]
+    static_features = [c for c in saved["features"] if c in feat_df.columns]
 
     odds_years = sorted(odds_df["year"].unique())
     backtest_years = [y for y in odds_years if y >= 2016]

@@ -247,6 +247,43 @@ def get_team_ops(team: str, year: int, batting_stats_df: pd.DataFrame) -> float:
     return float(np.average(subset["OPS"], weights=subset["PA"].clip(lower=1)))
 
 
+def compute_sp_workload_live(sp_name_norm: str | None,
+                              sp_id: str | None,
+                              game_date: pd.Timestamp,
+                              game_logs_df: pd.DataFrame) -> dict:
+    """
+    Return days_rest and outs_last_start for a starting pitcher going into game_date.
+    Matches by pitcher_id first, falls back to normalized name match.
+    """
+    empty = {"sp_days_rest": np.nan, "sp_outs_last": np.nan}
+    if game_logs_df is None or game_logs_df.empty:
+        return empty
+
+    gl = game_logs_df[game_logs_df["is_starter"]].copy()
+    gl["game_date"] = pd.to_datetime(gl["game_date"])
+
+    # Match on pitcher_id if available, else on normalized name
+    if sp_id:
+        pitcher_starts = gl[gl["pitcher_id"] == sp_id]
+    elif sp_name_norm:
+        from fetch_pitcher_stuff import _normalize_name
+        gl["name_norm"] = gl["pitcher_name"].apply(
+            lambda n: _normalize_name(str(n)) if pd.notna(n) else ""
+        )
+        pitcher_starts = gl[gl["name_norm"] == sp_name_norm]
+    else:
+        return empty
+
+    prior = pitcher_starts[pitcher_starts["game_date"] < game_date].sort_values("game_date")
+    if prior.empty:
+        return empty
+
+    last_start = prior.iloc[-1]
+    days_rest  = int(np.clip((game_date - last_start["game_date"]).days - 1, 0, 10))
+    outs_last  = float(last_start["outs_recorded"])
+    return {"sp_days_rest": days_rest, "sp_outs_last": outs_last}
+
+
 def compute_bullpen_usage_live(team: str,
                                game_date: pd.Timestamp,
                                game_logs_df: pd.DataFrame,
@@ -298,16 +335,56 @@ def compute_h2h_live(home_team: str,
         if row["home_team"] == home_team:
             # home_team was home in this prior game
             wins.append(row["home_win"])
-            rds.append(row.get("home_rolling_rd", np.nan) - row.get("away_rolling_rd", np.nan))
+            rds.append(row.get("home_runs", np.nan) - row.get("away_runs", np.nan))
         else:
             # home_team was the away team in this prior game
             wins.append(1 - row["home_win"])
-            rds.append(row.get("away_rolling_rd", np.nan) - row.get("home_rolling_rd", np.nan))
+            rds.append(row.get("away_runs", np.nan) - row.get("home_runs", np.nan))
 
     return {
         "h2h_home_win_rate": float(np.nanmean(wins)),
         "h2h_home_run_diff": float(np.nanmean(rds)),
     }
+
+
+def _compute_season_win_pct(team: str, year: int,
+                             features_df: pd.DataFrame,
+                             live_logs: pd.DataFrame | None,
+                             min_games: int = 10) -> float:
+    """
+    Compute season win% from scratch for the given team/year using all games
+    in features_df plus any newer games in live_logs.  Returns NaN until
+    min_games have been played (matches the training feature's min_periods=10).
+    """
+    mask = (
+        ((features_df["home_team"] == team) | (features_df["away_team"] == team))
+        & (features_df["year"] == year)
+        & (features_df["home_win"].notna())
+    )
+    season_games = features_df[mask].sort_values("Date")
+
+    wins = total = 0
+    for _, row in season_games.iterrows():
+        is_home = row["home_team"] == team
+        wins  += int((row["home_win"] == 1) if is_home else (row["home_win"] == 0))
+        total += 1
+
+    if live_logs is not None and not live_logs.empty:
+        last_date = season_games["Date"].max() if not season_games.empty else pd.Timestamp("2000-01-01")
+        ll = live_logs.copy()
+        ll["Date"] = pd.to_datetime(ll["Date"])
+        newer = ll[
+            (ll["Date"] > last_date)
+            & (ll["Date"].dt.year == year)
+            & ((ll["home_team"] == team) | (ll["away_team"] == team))
+            & (ll["home_win"].notna())
+        ]
+        for _, row in newer.iterrows():
+            is_home = row["home_team"] == team
+            wins  += int((row["home_win"] == 1) if is_home else (row["home_win"] == 0))
+            total += 1
+
+    return wins / total if total >= min_games else np.nan
 
 
 def _compute_current_streak(team: str, last_features_date: pd.Timestamp,
@@ -363,6 +440,9 @@ def get_latest_team_features(team: str,
     current_streak = _compute_current_streak(team, pd.Timestamp(last["Date"]),
                                              raw_streak, live_logs)
 
+    prior_win_pct   = last.get(f"{prefix}_prior_win_pct", np.nan)
+    season_win_pct  = _compute_season_win_pct(team, year, features_df, live_logs)
+
     return {
         "rolling_rd":           last.get(f"{prefix}_rolling_rd",           np.nan),
         "rolling_rs":           last.get(f"{prefix}_rolling_rs",           np.nan),
@@ -373,7 +453,11 @@ def get_latest_team_features(team: str,
         "last7_rd":             last.get(f"{prefix}_last7_rd",             np.nan),
         "streak":               current_streak,
         "momentum":             last.get(f"{prefix}_momentum",             np.nan),
-        "prior_win_pct":        last.get(f"{prefix}_prior_win_pct",        np.nan),
+        "prior_win_pct":        prior_win_pct,
+        "season_win_pct":       season_win_pct,
+        "season_win_pct_delta": (season_win_pct - prior_win_pct
+                                  if not np.isnan(season_win_pct) and not np.isnan(prior_win_pct)
+                                  else np.nan),
     }
 
 
@@ -524,6 +608,20 @@ def build_input_row(home: dict, away: dict) -> pd.DataFrame:
         "home_prior_win_pct": home.get("prior_win_pct", np.nan),
         "away_prior_win_pct": away.get("prior_win_pct", np.nan),
         "prior_win_pct_diff": _safe_diff(home.get("prior_win_pct"), away.get("prior_win_pct")),
+        # Current-season running win% + delta vs prior-year baseline
+        "home_season_win_pct":       home.get("season_win_pct", np.nan),
+        "away_season_win_pct":       away.get("season_win_pct", np.nan),
+        "season_win_pct_diff":       _safe_diff(home.get("season_win_pct"), away.get("season_win_pct")),
+        "home_season_win_pct_delta": home.get("season_win_pct_delta", np.nan),
+        "away_season_win_pct_delta": away.get("season_win_pct_delta", np.nan),
+        "season_win_pct_delta_diff": _safe_diff(home.get("season_win_pct_delta"), away.get("season_win_pct_delta")),
+        # SP workload: days since last start + outs in previous outing
+        "home_sp_days_rest":  home.get("sp_days_rest", np.nan),
+        "away_sp_days_rest":  away.get("sp_days_rest", np.nan),
+        "sp_days_rest_diff":  _safe_diff(home.get("sp_days_rest"), away.get("sp_days_rest")),
+        "home_sp_outs_last":  home.get("sp_outs_last", np.nan),
+        "away_sp_outs_last":  away.get("sp_outs_last", np.nan),
+        "sp_outs_last_diff":  _safe_diff(home.get("sp_outs_last"), away.get("sp_outs_last")),
         # Prior-season Statcast power metrics
         "home_barrel_pct":   home.get("barrel_pct",   np.nan),
         "away_barrel_pct":   away.get("barrel_pct",   np.nan),
@@ -537,11 +635,28 @@ def build_input_row(home: dict, away: dict) -> pd.DataFrame:
         "home_lineup_ops":    home.get("lineup_ops",   np.nan),
         "away_lineup_ops":    away.get("lineup_ops",   np.nan),
         "lineup_ops_diff":    _safe_diff(home.get("lineup_ops"), away.get("lineup_ops")),
+        "home_lineup_ops_vs_sp": home.get("lineup_ops_vs_sp", np.nan),
+        "away_lineup_ops_vs_sp": away.get("lineup_ops_vs_sp", np.nan),
+        "lineup_ops_vs_sp_diff": _safe_diff(home.get("lineup_ops_vs_sp"),
+                                             away.get("lineup_ops_vs_sp")),
+        "home_lineup_known_batters": home.get("lineup_known_batters", np.nan),
+        "away_lineup_known_batters": away.get("lineup_known_batters", np.nan),
+        "lineup_known_batters_diff": _safe_diff(home.get("lineup_known_batters"),
+                                                 away.get("lineup_known_batters")),
         # Batting OPS vs SP handedness
         "home_batting_ops_vs_sp":  home.get("batting_ops_vs_sp", np.nan),
         "away_batting_ops_vs_sp":  away.get("batting_ops_vs_sp", np.nan),
         "batting_ops_vs_sp_diff":  _safe_diff(home.get("batting_ops_vs_sp"),
                                                away.get("batting_ops_vs_sp")),
+        "home_platoon_advantage":  home.get("platoon_advantage", np.nan),
+        "away_platoon_advantage":  away.get("platoon_advantage", np.nan),
+        "platoon_advantage_diff":  _safe_diff(home.get("platoon_advantage"),
+                                               away.get("platoon_advantage")),
+        "home_opp_sp_is_lhp":      home.get("opp_sp_is_lhp", np.nan),
+        "away_opp_sp_is_lhp":      away.get("opp_sp_is_lhp", np.nan),
+        "home_sp_is_lhp":          home.get("sp_is_lhp", np.nan),
+        "away_sp_is_lhp":          away.get("sp_is_lhp", np.nan),
+        "both_sp_same_hand":       home.get("both_sp_same_hand", np.nan),
     }])
 
 
@@ -694,7 +809,8 @@ def predict_matchup(home_team: str,
     home_sp_throws = away_sp_throws = None
     try:
         pitcher_stuff_df = _load_csv(os.path.join(DATA_DIR, "pitcher_stuff.csv"))
-        stuff_year = year - 1 if year > gdate.year else year
+        # Match training: season-level SP stuff uses prior-season values.
+        stuff_year = year - 1
         # Prefer explicitly supplied SP names; fall back to last known from features
         if home_sp_name:
             home_sp_norm = _normalize_name(home_sp_name)
@@ -731,6 +847,19 @@ def predict_matchup(home_team: str,
     except Exception:
         pass
 
+    # SP workload: days since last start + outs in last start
+    try:
+        home_sp_work = compute_sp_workload_live(
+            home_sp_norm, None, gdate, game_logs_df)
+        away_sp_work = compute_sp_workload_live(
+            away_sp_norm, None, gdate, game_logs_df)
+    except Exception:
+        home_sp_work = away_sp_work = {"sp_days_rest": np.nan, "sp_outs_last": np.nan}
+    home_feats["sp_days_rest"] = home_sp_work["sp_days_rest"]
+    home_feats["sp_outs_last"] = home_sp_work["sp_outs_last"]
+    away_feats["sp_days_rest"] = away_sp_work["sp_days_rest"]
+    away_feats["sp_outs_last"] = away_sp_work["sp_outs_last"]
+
     # L/R batting splits (OPS vs SP handedness)
     try:
         splits_df = _load_csv(os.path.join(DATA_DIR, "team_splits.csv"))
@@ -738,8 +867,25 @@ def predict_matchup(home_team: str,
             home_team, year, away_sp_throws, splits_df)
         away_feats["batting_ops_vs_sp"] = get_team_split_ops(
             away_team, year, home_sp_throws, splits_df)
+        home_feats["platoon_advantage"] = _safe_diff(
+            home_feats.get("batting_ops_vs_sp"), home_feats.get("team_ops")
+        )
+        away_feats["platoon_advantage"] = _safe_diff(
+            away_feats.get("batting_ops_vs_sp"), away_feats.get("team_ops")
+        )
     except Exception:
         pass
+
+    home_feats["opp_sp_is_lhp"] = 1.0 if away_sp_throws == "L" else 0.0 if away_sp_throws == "R" else np.nan
+    away_feats["opp_sp_is_lhp"] = 1.0 if home_sp_throws == "L" else 0.0 if home_sp_throws == "R" else np.nan
+    home_feats["sp_is_lhp"] = 1.0 if home_sp_throws == "L" else 0.0 if home_sp_throws == "R" else np.nan
+    away_feats["sp_is_lhp"] = 1.0 if away_sp_throws == "L" else 0.0 if away_sp_throws == "R" else np.nan
+    if home_sp_throws in ("L", "R") and away_sp_throws in ("L", "R"):
+        same_hand = 1.0 if home_sp_throws == away_sp_throws else 0.0
+    else:
+        same_hand = np.nan
+    home_feats["both_sp_same_hand"] = same_hand
+    away_feats["both_sp_same_hand"] = same_hand
 
     # Vegas moneylines (devigged consensus probability)
     try:
@@ -756,6 +902,12 @@ def predict_matchup(home_team: str,
         h_lops, a_lops = get_lineup_ops(home_team, away_team, lineups_df)
         home_feats["lineup_ops"] = h_lops
         away_feats["lineup_ops"] = a_lops
+        # Live lineup fetch currently returns season OPS, not player L/R splits.
+        # Use it as a live fallback for the trained lineup-vs-SP slot.
+        home_feats["lineup_ops_vs_sp"] = h_lops
+        away_feats["lineup_ops_vs_sp"] = a_lops
+        home_feats["lineup_known_batters"] = 9 if pd.notna(h_lops) else np.nan
+        away_feats["lineup_known_batters"] = 9 if pd.notna(a_lops) else np.nan
     except Exception:
         lineups_df = None
         h_lops = a_lops = np.nan
@@ -804,6 +956,16 @@ def predict_matchup(home_team: str,
         if hbu == hbu:   # not NaN
             print(f"    Home bullpen outs (3d) : {int(hbu)} outs  (~{hbu/3:.1f} IP)")
             print(f"    Away bullpen outs (3d) : {int(abu)} outs  (~{abu/3:.1f} IP)")
+        hswp = home_feats.get("season_win_pct")
+        aswp = away_feats.get("season_win_pct")
+        hpwp = home_feats.get("prior_win_pct", np.nan)
+        apwp = away_feats.get("prior_win_pct", np.nan)
+        if hswp == hswp:   # not NaN
+            hdelta = hswp - hpwp if not np.isnan(hpwp) else np.nan
+            adelta = aswp - apwp if not np.isnan(apwp) else np.nan
+            delta_str = lambda d: f" ({d:+.1%} vs prior yr)" if d == d else ""
+            print(f"    Home season win%       : {hswp:.1%}{delta_str(hdelta)}")
+            print(f"    Away season win%       : {aswp:.1%}{delta_str(adelta)}")
         hop = home_feats.get("team_ops")
         aop = away_feats.get("team_ops")
         if hop == hop:
@@ -833,6 +995,15 @@ def predict_matchup(home_team: str,
                   f"(run factor {urf:.3f} — {tendency})")
         else:
             print(f"    Umpire                 : unknown (using neutral 1.000)")
+        hdr = home_feats.get("sp_days_rest")
+        if hdr == hdr:   # not NaN
+            adr = away_feats.get("sp_days_rest", np.nan)
+            hol = home_feats.get("sp_outs_last", np.nan)
+            aol = away_feats.get("sp_outs_last", np.nan)
+            hol_str = f"{hol/3:.1f} IP" if hol == hol else "?"
+            aol_str = f"{aol/3:.1f} IP" if aol == aol else "?"
+            print(f"    Home SP days rest      : {int(hdr)}d  (last start: {hol_str})")
+            print(f"    Away SP days rest      : {int(adr)}d  (last start: {aol_str})")
         hfbv = home_feats.get("sp_fbv")
         if hfbv and hfbv == hfbv:
             afbv = away_feats.get("sp_fbv", np.nan)

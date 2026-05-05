@@ -185,8 +185,11 @@ if __name__ == "__main__":
     print(f"Game logs shape: {game_logs.shape}")
 
     print("\n=== Fetching pitcher stats ===")
+    # Start one year before the feature window so prior-season SP baselines
+    # are available for the first modeled season.
+    pitcher_years = sorted(set([min(all_years) - 1] + all_years))
     pitcher_stats = fetch_pitcher_stats(
-        all_years,
+        pitcher_years,
         cache_path=os.path.join(DATA_DIR, "pitcher_stats.csv"),
     )
     print(f"Pitcher stats shape: {pitcher_stats.shape}")

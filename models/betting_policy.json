@@ -1,0 +1,11 @@
+{
+  "name": "manual_mid_underdog_130_170_edge_3pct",
+  "rules": [
+    {
+      "bucket": "+130:+170",
+      "min_edge": 0.03,
+      "season_phase": "mid",
+      "min_model_prob": 0.5
+    }
+  ]
+}

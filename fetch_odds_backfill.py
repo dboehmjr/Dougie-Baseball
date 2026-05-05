@@ -68,6 +68,21 @@ def devig_prob(home_ml: float, away_ml: float) -> float:
     return p_h / total if total > 0 else np.nan
 
 
+def _first_number(d: dict, names: list[str]) -> float | None:
+    for name in names:
+        val = d.get(name)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _avg(vals: list[float]) -> float | None:
+    return float(np.mean(vals)) if vals else None
+
+
 def fetch_date(game_date: date) -> list[dict]:
     date_str = game_date.strftime("%Y%m%d")
     try:
@@ -98,6 +113,8 @@ def fetch_date(game_date: date) -> list[dict]:
         away_runs = bs.get("away", {}).get("runs")
 
         home_mls, away_mls = [], []
+        open_home_mls, open_away_mls = [], []
+        close_home_mls, close_away_mls = [], []
         for o in g.get("odds", []):
             if o.get("type") != "game":
                 continue
@@ -109,14 +126,28 @@ def fetch_date(game_date: date) -> list[dict]:
                     away_mls.append(float(ma))
                 except (TypeError, ValueError):
                     pass
+            oh = _first_number(o, ["ml_home_open", "open_ml_home", "opening_ml_home", "home_ml_open"])
+            oa = _first_number(o, ["ml_away_open", "open_ml_away", "opening_ml_away", "away_ml_open"])
+            ch = _first_number(o, ["ml_home_close", "close_ml_home", "closing_ml_home", "home_ml_close"])
+            ca = _first_number(o, ["ml_away_close", "close_ml_away", "closing_ml_away", "away_ml_close"])
+            if oh is not None and oa is not None:
+                open_home_mls.append(oh)
+                open_away_mls.append(oa)
+            if ch is not None and ca is not None:
+                close_home_mls.append(ch)
+                close_away_mls.append(ca)
 
         if not home_mls or not away_mls:
             continue
 
         home_ml_avg = float(np.mean(home_mls))
         away_ml_avg = float(np.mean(away_mls))
+        open_home_ml = _avg(open_home_mls)
+        open_away_ml = _avg(open_away_mls)
+        close_home_ml = _avg(close_home_mls)
+        close_away_ml = _avg(close_away_mls)
 
-        rows.append({
+        row = {
             "game_date":      str(game_date),
             "home_team":      home_abbr,
             "away_team":      away_abbr,
@@ -127,7 +158,20 @@ def fetch_date(game_date: date) -> list[dict]:
             "consensus_prob": round(devig_prob(home_ml_avg, away_ml_avg), 4),
             "home_runs":      int(home_runs) if home_runs is not None else None,
             "away_runs":      int(away_runs) if away_runs is not None else None,
-        })
+        }
+        if open_home_ml is not None and open_away_ml is not None:
+            row.update({
+                "open_home_ml": round(open_home_ml, 1),
+                "open_away_ml": round(open_away_ml, 1),
+                "open_consensus_prob": round(devig_prob(open_home_ml, open_away_ml), 4),
+            })
+        if close_home_ml is not None and close_away_ml is not None:
+            row.update({
+                "close_home_ml": round(close_home_ml, 1),
+                "close_away_ml": round(close_away_ml, 1),
+                "close_consensus_prob": round(devig_prob(close_home_ml, close_away_ml), 4),
+            })
+        rows.append(row)
 
     return rows
 

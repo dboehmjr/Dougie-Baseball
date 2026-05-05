@@ -3,8 +3,8 @@ Backtest the win probability model on all completed 2026 games using
 Action Network consensus moneylines for edge calculation.
 
 Strategy:
-  - Bet the side where model probability exceeds devigged Vegas implied prob by > 3%
-  - Size with 25% fractional Kelly, capped at 10% of current bankroll
+  - Bet the side where model probability exceeds devigged Vegas implied prob by > 6%
+  - Size with 5% fractional Kelly, capped at 2% of current bankroll
   - Starting bankroll: $100
   - No look-ahead: predictions use only features available before each game
 
@@ -17,16 +17,18 @@ import os
 import numpy as np
 import pandas as pd
 import joblib
+from betting_context import attach_starting_pitcher_context, enrich_bet_record, odds_merge_columns
+from betting_strategy import choose_bet, load_policy
 
 DATA_DIR    = os.path.join(os.path.dirname(__file__), "data")
 MODELS_DIR  = os.path.join(os.path.dirname(__file__), "models")
-MODEL_PATH  = os.path.join(MODELS_DIR, "win_prob_model.pkl")
+MODEL_PATH  = os.path.join(MODELS_DIR, "win_prob_model.pkl")  # market-independent edge model
+POLICY_PATH = os.path.join(MODELS_DIR, "betting_policy.json")
 FEATURES_PATH  = os.path.join(DATA_DIR, "features.csv")
 ODDS_PATH      = os.path.join(DATA_DIR, "action_network_odds_2026.csv")
 GAMES_PATH     = os.path.join(DATA_DIR, "game_logs_live.csv")
 
 STARTING_BANKROLL = 100.0
-MIN_EDGE          = 0.03
 KELLY_FRAC        = 0.25
 MAX_BET_PCT       = 0.10
 
@@ -68,6 +70,7 @@ def run_backtest() -> pd.DataFrame:
     bundle    = joblib.load(MODEL_PATH)
     pipeline  = bundle["pipeline"]
     feat_cols = bundle["features"]
+    policy    = load_policy(POLICY_PATH)
 
     features = pd.read_csv(FEATURES_PATH, parse_dates=["Date"])
     features = features[features["year"] == 2026].copy()
@@ -86,22 +89,23 @@ def run_backtest() -> pd.DataFrame:
     print(f"Odds rows after validity filter: {len(odds_clean)} / {len(odds)}")
 
     merged = features.merge(
-        odds_clean[["game_date", "home_team", "away_team", "home_ml", "away_ml", "consensus_prob"]],
+        odds_clean[odds_merge_columns(odds_clean)],
         on=["game_date", "home_team", "away_team"],
         how="left",
     )
 
-    # Load scores for display (not in features)
-    games = pd.read_csv(GAMES_PATH, parse_dates=["Date"])
-    games["game_date"] = games["Date"].dt.strftime("%Y-%m-%d")
-    merged = merged.merge(
-        games[["game_date", "home_team", "away_team", "home_runs", "away_runs"]],
-        on=["game_date", "home_team", "away_team"],
-        how="left",
-    )
+    if "home_runs" not in merged.columns or "away_runs" not in merged.columns:
+        games = pd.read_csv(GAMES_PATH, parse_dates=["Date"])
+        games["game_date"] = games["Date"].dt.strftime("%Y-%m-%d")
+        merged = merged.merge(
+            games[["game_date", "home_team", "away_team", "home_runs", "away_runs"]],
+            on=["game_date", "home_team", "away_team"],
+            how="left",
+        )
 
     merged = merged[merged["home_win"].notna()].copy()
     merged = merged.sort_values("Date").reset_index(drop=True)
+    merged = attach_starting_pitcher_context(merged)
 
     print(f"Games in features  : {len(merged)}")
     print(f"Games with odds    : {merged['consensus_prob'].notna().sum()}")
@@ -132,44 +136,67 @@ def run_backtest() -> pd.DataFrame:
         }
 
         if pd.isna(home_ml) or pd.isna(away_ml):
-            records.append({**base, "bet_side": None, "stake": 0, "odds": None,
-                            "model_prob": None, "vegas_prob": None, "edge": None,
-                            "won": None, "game_pnl": 0, "bankroll": bankroll})
+            records.append(enrich_bet_record(
+                {**base, "bet_side": None, "stake": 0, "odds": None,
+                 "model_prob": None, "vegas_prob": None, "edge": None,
+                 "odds_bucket": None, "edge_threshold": None,
+                 "policy_reason": "missing odds",
+                 "policy_name": policy.name,
+                 "won": None, "game_pnl": 0, "bankroll": bankroll},
+                row=row, side=None, model_prob=None, vegas_prob=None, odds=None,
+            ))
             continue
 
         vegas_home = devig_prob(home_ml, away_ml)
-        vegas_away = 1 - vegas_home
-        edge_home  = p_home - vegas_home
-        edge_away  = p_away - vegas_away
+        pick = choose_bet(
+            home=home, away=away, p_home=p_home,
+            home_ml=home_ml, away_ml=away_ml, vegas_home=vegas_home,
+            policy=policy, game_date=date,
+        )
 
-        if edge_home >= edge_away and edge_home > MIN_EDGE:
-            bet_side, bet_p, pick_ml, bet_edge, vegas_p = home, p_home, home_ml, edge_home, vegas_home
-        elif edge_away > edge_home and edge_away > MIN_EDGE:
-            bet_side, bet_p, pick_ml, bet_edge, vegas_p = away, p_away, away_ml, edge_away, vegas_away
-        else:
-            records.append({**base, "bet_side": None, "stake": 0, "odds": None,
-                            "model_prob": round(max(p_home, p_away), 4),
-                            "vegas_prob": round(vegas_home, 4),
-                            "edge": round(max(edge_home, edge_away), 4),
-                            "won": None, "game_pnl": 0, "bankroll": bankroll})
+        if not pick["should_bet"]:
+            records.append(enrich_bet_record(
+                {**base, "bet_side": None, "stake": 0, "odds": pick["odds"],
+                 "model_prob": round(pick["model_prob"], 4),
+                 "vegas_prob": round(pick["vegas_prob"], 4),
+                 "edge": round(pick["edge"], 4),
+                 "odds_bucket": pick["odds_bucket"],
+                 "season_phase": pick["season_phase"],
+                 "edge_threshold": pick["edge_threshold"],
+                 "policy_reason": pick["policy_reason"],
+                 "policy_name": policy.name,
+                 "won": None, "game_pnl": 0, "bankroll": bankroll},
+                row=row, side=pick["side"], model_prob=pick["model_prob"],
+                vegas_prob=pick["vegas_prob"], odds=pick["odds"],
+            ))
             continue
 
+        bet_side = pick["side"]
+        bet_p = pick["model_prob"]
+        pick_ml = pick["odds"]
+        bet_edge = pick["edge"]
+        vegas_p = pick["vegas_prob"]
         stake    = kelly_stake(bet_p, bankroll, pick_ml)
         won      = (row["home_win"] == 1) if bet_side == home else (row["home_win"] == 0)
         game_pnl = calc_pnl(stake, pick_ml, won)
         bankroll = round(bankroll + game_pnl, 2)
 
-        records.append({**base,
+        records.append(enrich_bet_record({**base,
             "bet_side":   bet_side,
             "stake":      stake,
             "odds":       pick_ml,
             "model_prob": round(bet_p, 4),
             "vegas_prob": round(vegas_p, 4),
             "edge":       round(bet_edge, 4),
+            "odds_bucket": pick["odds_bucket"],
+            "season_phase": pick["season_phase"],
+            "edge_threshold": pick["edge_threshold"],
+            "policy_reason": pick["policy_reason"],
+            "policy_name": policy.name,
             "won":        won,
             "game_pnl":   game_pnl,
             "bankroll":   bankroll,
-        })
+        }, row=row, side=bet_side, model_prob=bet_p, vegas_prob=vegas_p, odds=pick_ml))
 
     return pd.DataFrame(records)
 

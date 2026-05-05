@@ -185,7 +185,7 @@ def _fetch_year(year: int) -> pd.DataFrame:
     return df
 
 
-def fetch_pitcher_stuff(start_year: int = 2015,
+def fetch_pitcher_stuff(start_year: int = 2014,
                         end_year: int | None = None,
                         cache_path: str = CACHE_PATH) -> pd.DataFrame:
     if end_year is None:
@@ -341,63 +341,35 @@ def get_pitcher_stuff(name_norm: str,
 
 def backfill_handedness(cache_path: str = CACHE_PATH) -> pd.DataFrame:
     """
-    Look up pitcher handedness (R/L) from the MLB Stats API for any row
-    in pitcher_stuff.csv that has Throws == NaN.  Results are cached in
-    data/pitcher_handedness.json so API calls only happen once per pitcher.
+    Backfill pitcher handedness (R/L) using the shared Chadwick/MLB Stats API
+    path. Results are cached in data/pitcher_handedness.json.
     """
-    import json
     try:
-        import statsapi
-    except ImportError:
-        print("  statsapi not installed — skipping handedness backfill")
+        from backfill_handedness import (
+            _load_cache,
+            _save_cache,
+            apply_to_pitcher_stuff,
+            build_name_universe,
+            update_from_chadwick,
+            update_from_statsapi,
+        )
+        hand_cache = _load_cache()
+        hand_cache, chadwick_resolved, name_to_mlbam = update_from_chadwick(hand_cache)
+        print(f"  Chadwick/MLBAM handedness updates: {chadwick_resolved:,}")
+        print(f"  Chadwick MLBAM ID matches: {len(name_to_mlbam):,}")
+        hand_cache, api_resolved = update_from_statsapi(
+            hand_cache, build_name_universe(), refresh_null=False
+        )
+        print(f"  MLB Stats API handedness updates: {api_resolved:,}")
+        _save_cache(hand_cache)
+        added, total = apply_to_pitcher_stuff(hand_cache, cache_path)
+        df = pd.read_csv(cache_path) if os.path.exists(cache_path) else pd.DataFrame()
+        resolved = df["Throws"].notna().sum() if "Throws" in df.columns else 0
+        print(f"  Throws populated for {resolved:,}/{total:,} pitcher-seasons (+{added:,})")
+        return df
+    except Exception as exc:
+        print(f"  Handedness backfill failed — {exc}")
         return pd.read_csv(cache_path) if os.path.exists(cache_path) else pd.DataFrame()
-
-    hand_cache_path = os.path.join(DATA_DIR, "pitcher_handedness.json")
-    hand_cache: dict[str, str | None] = {}
-    if os.path.exists(hand_cache_path):
-        with open(hand_cache_path) as f:
-            hand_cache = json.load(f)
-
-    df = pd.read_csv(cache_path)
-    missing_names = df.loc[df["Throws"].isna(), "name_norm"].unique().tolist()
-    to_lookup = [n for n in missing_names if n not in hand_cache and isinstance(n, str) and n.strip()]
-
-    if to_lookup:
-        print(f"  Looking up handedness for {len(to_lookup)} pitchers via MLB Stats API...")
-        for name_norm in to_lookup:
-            try:
-                # Step 1: find player ID by name
-                results = statsapi.lookup_player(name_norm)
-                found = None
-                for p in results:
-                    if (p.get("primaryPosition") or {}).get("code") == "1":
-                        pid = p.get("id")
-                        if pid:
-                            # Step 2: fetch full person record for pitchHand
-                            person_data = statsapi.get("person", {"personId": pid})
-                            person = (person_data.get("people") or [{}])[0]
-                            hand = (person.get("pitchHand") or {}).get("code")
-                            if hand in ("R", "L"):
-                                found = hand
-                                break
-                hand_cache[name_norm] = found
-                time.sleep(0.08)
-            except Exception:
-                hand_cache[name_norm] = None
-
-        with open(hand_cache_path, "w") as f:
-            json.dump(hand_cache, f)
-        print(f"  Handedness cache updated: {sum(1 for v in hand_cache.values() if v)} pitchers resolved")
-
-    df["Throws"] = df.apply(
-        lambda r: hand_cache.get(r["name_norm"], r["Throws"])
-        if pd.isna(r["Throws"]) else r["Throws"],
-        axis=1,
-    )
-    df.to_csv(cache_path, index=False)
-    resolved = df["Throws"].notna().sum()
-    print(f"  Throws populated for {resolved:,}/{len(df):,} pitcher-seasons")
-    return df
 
 
 if __name__ == "__main__":

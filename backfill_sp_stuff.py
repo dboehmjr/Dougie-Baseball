@@ -4,7 +4,7 @@ Backfill SP pitch stuff into features.csv using game_sp.csv + pitcher_stuff.csv.
 For each game in features.csv:
   1. Look up the home/away SP name from game_sp.csv
   2. Normalize the name
-  3. Look up their stuff stats from pitcher_stuff.csv for that year
+  3. Look up their prior-season stuff stats from pitcher_stuff.csv
      (falls back to team median if no direct match)
   4. Write home_sp_fbv, away_sp_fbv, sp_fbv_diff, home_sp_swstr, etc.
 
@@ -118,7 +118,7 @@ def backfill(features_path: str = FEATURES_PATH,
     n_miss   = 0
 
     for idx, row in merged.iterrows():
-        year       = int(row["year"])
+        year       = int(row["year"]) - 1
         home_team  = row["home_team"]
         away_team  = row["away_team"]
         h_norm     = row.get("home_sp_norm", "")

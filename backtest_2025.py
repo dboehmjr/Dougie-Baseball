@@ -1,180 +1,262 @@
 """
-Backtest the saved win-probability model against all 2025 MLB games.
+Backtest the win probability model on the full 2025 season.
+2025 is the model's true hold-out year (trained on 2015-2024).
+Uses Action Network consensus moneylines from action_network_odds_2022_2025.csv.
 
-Uses the pre-computed features.csv rows (year == 2025) — features were built
-using only data available before each game, so there is no leakage.
+Strategy:
+  - Bet the side where model probability exceeds devigged Vegas implied prob by > 6%
+  - Size with 5% fractional Kelly, capped at 2% of current bankroll
+  - Starting bankroll: $100
+  - No look-ahead: predictions use only features available before each game
 
-Output:
-  - Overall accuracy, log loss, Brier score, ROC AUC
-  - Accuracy by confidence band (how often do we win when we're most sure?)
-  - Calibration table (are 60% predictions right ~60% of the time?)
-  - Accuracy by month
-  - Worst-miss games (biggest upsets we got wrong)
-  - Saves backtest_2025_results.csv for further analysis
+Output: prints summary + saves data/backtest_2025_kelly.csv
 """
 
 from __future__ import annotations
 
 import os
-import joblib
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import joblib
+from betting_context import attach_starting_pitcher_context, enrich_bet_record, odds_merge_columns
+from betting_strategy import choose_bet
 
-from sklearn.metrics import (
-    accuracy_score, log_loss, brier_score_loss, roc_auc_score
-)
+DATA_DIR      = os.path.join(os.path.dirname(__file__), "data")
+MODELS_DIR    = os.path.join(os.path.dirname(__file__), "models")
+MODEL_PATH    = os.path.join(MODELS_DIR, "win_prob_model.pkl")  # market-independent edge model
+FEATURES_PATH = os.path.join(DATA_DIR, "features.csv")
+ODDS_PATH     = os.path.join(DATA_DIR, "action_network_odds_2022_2025.csv")
 
-DATA_DIR  = os.path.join(os.path.dirname(__file__), "data")
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
-PLOTS_DIR = os.path.join(os.path.dirname(__file__), "plots")
-os.makedirs(PLOTS_DIR, exist_ok=True)
+STARTING_BANKROLL = 100.0
+KELLY_FRAC        = 0.25
+MAX_BET_PCT       = 0.10
 
-# ── Load model ────────────────────────────────────────────────────────────────
-model_path = os.path.join(MODEL_DIR, "win_prob_model.pkl")
-artifact   = joblib.load(model_path)
-pipeline   = artifact["pipeline"]
-feat_cols  = artifact["features"]
-print(f"Model loaded  ({len(feat_cols)} features)")
 
-# ── Load 2025 games ───────────────────────────────────────────────────────────
-features_path = os.path.join(DATA_DIR, "features.csv")
-df = pd.read_csv(features_path, parse_dates=["Date"])
-games_2025 = df[df["year"] == 2025].copy().sort_values("Date").reset_index(drop=True)
-print(f"2025 games    : {len(games_2025):,}")
+def american_to_implied(ml: float) -> float:
+    if ml > 0:
+        return 100 / (ml + 100)
+    return abs(ml) / (abs(ml) + 100)
 
-available = [c for c in feat_cols if c in games_2025.columns]
-missing   = [c for c in feat_cols if c not in games_2025.columns]
-if missing:
-    print(f"Missing cols  : {missing}  (will be imputed)")
 
-X = games_2025[available]
-y = games_2025["home_win"]
+def devig_prob(home_ml: float, away_ml: float) -> float:
+    ph = american_to_implied(home_ml)
+    pa = american_to_implied(away_ml)
+    t  = ph + pa
+    return ph / t if t > 0 else np.nan
 
-# ── Predict ───────────────────────────────────────────────────────────────────
-probs = pipeline.predict_proba(X)[:, 1]
-preds = (probs >= 0.5).astype(int)
 
-games_2025["prob_home_win"] = probs
-games_2025["predicted_winner"] = np.where(preds == 1,
-                                           games_2025["home_team"],
-                                           games_2025["away_team"])
-games_2025["correct"] = (preds == y.values).astype(int)
-games_2025["confidence"] = np.maximum(probs, 1 - probs)   # distance from 50/50
+def kelly_stake(p: float, bankroll: float, ml: float) -> float:
+    if ml == 0:
+        return 0.0
+    net  = (ml / 100) if ml > 0 else (100 / abs(ml))
+    if net == 0:
+        return 0.0
+    edge = p * net - (1 - p)
+    if edge <= 0:
+        return 0.0
+    k = KELLY_FRAC * (edge / net)
+    return round(min(k, MAX_BET_PCT) * bankroll, 2)
 
-# ── Overall metrics ───────────────────────────────────────────────────────────
-acc   = accuracy_score(y, preds)
-ll    = log_loss(y, probs)
-brier = brier_score_loss(y, probs)
-auc   = roc_auc_score(y, probs)
 
-print(f"\n{'='*50}")
-print(f"  2025 BACKTEST RESULTS  ({len(games_2025):,} games)")
-print(f"{'='*50}")
-print(f"  Accuracy        : {acc:.1%}  ({int(acc*len(games_2025))}/{len(games_2025)} correct)")
-print(f"  ROC AUC         : {auc:.4f}")
-print(f"  Log loss        : {ll:.4f}")
-print(f"  Brier score     : {brier:.4f}")
+def calc_pnl(stake: float, ml: float, won: bool) -> float:
+    if stake == 0:
+        return 0.0
+    net = (ml / 100) if ml > 0 else (100 / abs(ml))
+    return round(stake * net, 2) if won else round(-stake, 2)
 
-# ── Accuracy by confidence band ───────────────────────────────────────────────
-bands = [
-    (0.50, 0.55, "50–55%  (near coin-flip)"),
-    (0.55, 0.60, "55–60%  (slight lean)"),
-    (0.60, 0.65, "60–65%  (moderate)"),
-    (0.65, 0.70, "65–70%  (strong lean)"),
-    (0.70, 1.01, "70%+    (high confidence)"),
-]
 
-print(f"\n{'─'*50}")
-print(f"  Accuracy by confidence band:")
-print(f"  {'Band':<25} {'Games':>6}  {'Correct':>7}  {'Accuracy':>9}")
-print(f"  {'─'*25} {'─'*6}  {'─'*7}  {'─'*9}")
-for lo, hi, label in bands:
-    mask = (games_2025["confidence"] >= lo) & (games_2025["confidence"] < hi)
-    subset = games_2025[mask]
-    if len(subset) == 0:
-        continue
-    n = len(subset)
-    c = subset["correct"].sum()
-    print(f"  {label:<25} {n:>6}  {c:>7}  {c/n:>8.1%}")
+def run_backtest() -> pd.DataFrame:
+    bundle    = joblib.load(MODEL_PATH)
+    pipeline  = bundle["pipeline"]
+    feat_cols = bundle["features"]
 
-# ── Calibration table ─────────────────────────────────────────────────────────
-print(f"\n{'─'*50}")
-print(f"  Calibration (predicted vs actual home-win rate):")
-print(f"  {'Pred prob bucket':<20} {'Games':>6}  {'Actual win%':>12}")
-print(f"  {'─'*20} {'─'*6}  {'─'*12}")
-cal_bins = np.arange(0.35, 0.75, 0.05)
-for lo in cal_bins:
-    hi = lo + 0.05
-    mask = (probs >= lo) & (probs < hi)
-    n = mask.sum()
-    if n == 0:
-        continue
-    actual = y.values[mask].mean()
-    print(f"  {lo:.0%}–{hi:.0%}{'':12} {n:>6}  {actual:>11.1%}")
+    features = pd.read_csv(FEATURES_PATH, parse_dates=["Date"])
+    features = features[features["year"] == 2025].copy()
+    print(f"2025 feature rows  : {len(features)}")
 
-# ── Accuracy by month ─────────────────────────────────────────────────────────
-games_2025["month"] = games_2025["Date"].dt.month
-month_names = {4:"Apr", 5:"May", 6:"Jun", 7:"Jul", 8:"Aug", 9:"Sep", 10:"Oct"}
+    odds = pd.read_csv(ODDS_PATH, dtype={"game_date": str})
+    # Filter to 2025 rows only
+    odds = odds[odds["game_date"].str.startswith("2025")].copy()
+    print(f"2025 odds rows     : {len(odds)}")
 
-print(f"\n{'─'*50}")
-print(f"  Accuracy by month:")
-print(f"  {'Month':<6} {'Games':>6}  {'Correct':>7}  {'Accuracy':>9}")
-print(f"  {'─'*6} {'─'*6}  {'─'*7}  {'─'*9}")
-for m in sorted(games_2025["month"].unique()):
-    subset = games_2025[games_2025["month"] == m]
-    n = len(subset)
-    c = subset["correct"].sum()
-    print(f"  {month_names.get(m, m):<6} {n:>6}  {c:>7}  {c/n:>8.1%}")
+    # Filter corrupt odds rows (run-line juice mixed into ML averages)
+    def _imp(ml):
+        return 100 / (ml + 100) if ml > 0 else abs(ml) / (abs(ml) + 100)
+    odds["_imp_sum"] = odds["home_ml"].apply(_imp) + odds["away_ml"].apply(_imp)
+    odds_clean = odds[(odds["_imp_sum"] >= 1.03) & (odds["_imp_sum"] <= 1.13)].copy()
+    print(f"Odds after validity filter: {len(odds_clean)} / {len(odds)}")
 
-# ── Biggest upsets we got wrong ───────────────────────────────────────────────
-wrong = games_2025[games_2025["correct"] == 0].copy()
-wrong["surprise"] = wrong["confidence"]   # how wrong we were
-worst = wrong.nlargest(10, "surprise")
+    features["game_date"] = features["Date"].dt.strftime("%Y-%m-%d")
 
-print(f"\n{'─'*50}")
-print(f"  10 biggest upsets (high confidence, wrong pick):")
-print(f"  {'Date':<12} {'Matchup':<20} {'Pred%':>6}  {'Predicted':>10}  {'Actual':>10}")
-print(f"  {'─'*12} {'─'*20} {'─'*6}  {'─'*10}  {'─'*10}")
-for _, row in worst.iterrows():
-    matchup = f"{row['away_team']} @ {row['home_team']}"
-    pred_team = row["predicted_winner"]
-    actual_team = row["home_team"] if row["home_win"] == 1 else row["away_team"]
-    conf_pct = row["confidence"]
-    date_str = row["Date"].strftime("%Y-%m-%d")
-    print(f"  {date_str:<12} {matchup:<20} {conf_pct:>5.1%}  {pred_team:>10}  {actual_team:>10}")
+    merged = features.merge(
+        odds_clean[odds_merge_columns(odds_clean)],
+        on=["game_date", "home_team", "away_team"],
+        how="left",
+    )
 
-# ── Simulated betting edge ────────────────────────────────────────────────────
-# If you bet $1 on every game the model is ≥55% confident on (vs fair odds)
-confident = games_2025[games_2025["confidence"] >= 0.55]
-if len(confident) > 0:
-    bet_acc = confident["correct"].mean()
-    print(f"\n{'─'*50}")
-    print(f"  Betting edge simulation (≥55% confidence games):")
-    print(f"  Games bet      : {len(confident):,}  of  {len(games_2025):,}")
-    print(f"  Accuracy       : {bet_acc:.1%}")
-    print(f"  Break-even vs -110 juice: 52.4%")
-    print(f"  Edge vs break-even: {bet_acc - 0.524:+.1%}")
+    # Keep feature-engineered scores when present; older features.csv needs odds scores.
+    if ("home_runs" not in merged.columns or "away_runs" not in merged.columns) and "home_runs" in odds_clean.columns:
+        merged = merged.merge(
+            odds_clean[["game_date", "home_team", "away_team", "home_runs", "away_runs"]],
+            on=["game_date", "home_team", "away_team"],
+            how="left",
+        )
+    elif "home_runs" not in merged.columns or "away_runs" not in merged.columns:
+        merged["home_runs"] = np.nan
+        merged["away_runs"] = np.nan
 
-# ── Save results ──────────────────────────────────────────────────────────────
-out_path = os.path.join(DATA_DIR, "backtest_2025_results.csv")
-games_2025[["Date","home_team","away_team","home_win",
-            "prob_home_win","predicted_winner","correct","confidence"]
-           ].to_csv(out_path, index=False)
-print(f"\n{'='*50}")
-print(f"  Full results saved to {out_path}")
+    merged = merged[merged["home_win"].notna()].copy()
+    merged = merged.sort_values("Date").reset_index(drop=True)
+    merged = attach_starting_pitcher_context(merged)
 
-# ── Calibration plot ──────────────────────────────────────────────────────────
-from sklearn.calibration import calibration_curve
-fig, ax = plt.subplots(figsize=(7, 5))
-frac_pos, mean_pred = calibration_curve(y, probs, n_bins=10)
-ax.plot(mean_pred, frac_pos, "s-", color="#1f77b4", label=f"Model (AUC={auc:.3f})")
-ax.plot([0,1],[0,1],"k--",label="Perfect calibration")
-ax.set_xlabel("Mean predicted probability (home win)")
-ax.set_ylabel("Actual home win rate")
-ax.set_title("2025 Backtest — Calibration Curve")
-ax.legend(); ax.grid(True, alpha=0.3)
-plt.tight_layout()
-fig.savefig(os.path.join(PLOTS_DIR, "backtest_2025_calibration.png"), dpi=150)
-plt.close()
-print(f"  Calibration plot saved to plots/backtest_2025_calibration.png")
+    print(f"Games with outcome : {len(merged)}")
+    print(f"Games with odds    : {merged['consensus_prob'].notna().sum()}")
+
+    X = pd.DataFrame(index=merged.index)
+    for c in feat_cols:
+        X[c] = merged[c] if c in merged.columns else np.nan
+
+    probs = pipeline.predict_proba(X[feat_cols])[:, 1]
+    merged["model_home_prob"] = probs
+
+    records = []
+    bankroll = STARTING_BANKROLL
+
+    for _, row in merged.iterrows():
+        p_home = row["model_home_prob"]
+        p_away = 1 - p_home
+        home   = row["home_team"]
+        away   = row["away_team"]
+        date   = row["game_date"]
+
+        home_ml = row.get("home_ml", np.nan)
+        away_ml = row.get("away_ml", np.nan)
+
+        base = {
+            "date": date, "matchup": f"{away} @ {home}",
+            "home_score": row.get("home_runs"), "away_score": row.get("away_runs"),
+        }
+
+        if pd.isna(home_ml) or pd.isna(away_ml):
+            records.append(enrich_bet_record(
+                {**base, "bet_side": None, "stake": 0, "odds": None,
+                 "model_prob": None, "vegas_prob": None, "edge": None,
+                 "odds_bucket": None, "edge_threshold": None,
+                 "policy_reason": "missing odds",
+                 "won": None, "game_pnl": 0, "bankroll": bankroll},
+                row=row, side=None, model_prob=None, vegas_prob=None, odds=None,
+            ))
+            continue
+
+        vegas_home = devig_prob(home_ml, away_ml)
+        pick = choose_bet(
+            home=home, away=away, p_home=p_home,
+            home_ml=home_ml, away_ml=away_ml, vegas_home=vegas_home,
+            game_date=date,
+        )
+
+        if not pick["should_bet"]:
+            records.append(enrich_bet_record(
+                {**base, "bet_side": None, "stake": 0, "odds": pick["odds"],
+                 "model_prob": round(pick["model_prob"], 4),
+                 "vegas_prob": round(pick["vegas_prob"], 4),
+                 "edge": round(pick["edge"], 4),
+                 "odds_bucket": pick["odds_bucket"],
+                 "season_phase": pick["season_phase"],
+                 "edge_threshold": pick["edge_threshold"],
+                 "policy_reason": pick["policy_reason"],
+                 "won": None, "game_pnl": 0, "bankroll": bankroll},
+                row=row, side=pick["side"], model_prob=pick["model_prob"],
+                vegas_prob=pick["vegas_prob"], odds=pick["odds"],
+            ))
+            continue
+
+        bet_side = pick["side"]
+        bet_p = pick["model_prob"]
+        pick_ml = pick["odds"]
+        bet_edge = pick["edge"]
+        vegas_p = pick["vegas_prob"]
+        stake    = kelly_stake(bet_p, bankroll, pick_ml)
+        won      = (row["home_win"] == 1) if bet_side == home else (row["home_win"] == 0)
+        game_pnl = calc_pnl(stake, pick_ml, won)
+        bankroll = round(bankroll + game_pnl, 2)
+
+        records.append(enrich_bet_record({**base,
+            "bet_side":   bet_side,
+            "stake":      stake,
+            "odds":       pick_ml,
+            "model_prob": round(bet_p, 4),
+            "vegas_prob": round(vegas_p, 4),
+            "edge":       round(bet_edge, 4),
+            "odds_bucket": pick["odds_bucket"],
+            "season_phase": pick["season_phase"],
+            "edge_threshold": pick["edge_threshold"],
+            "policy_reason": pick["policy_reason"],
+            "won":        won,
+            "game_pnl":   game_pnl,
+            "bankroll":   bankroll,
+        }, row=row, side=bet_side, model_prob=bet_p, vegas_prob=vegas_p, odds=pick_ml))
+
+    return pd.DataFrame(records)
+
+
+def print_summary(df: pd.DataFrame):
+    bets = df[df["stake"] > 0].copy()
+
+    total_games  = len(df)
+    total_bets   = len(bets)
+    wins         = int(bets["won"].sum())
+    losses       = total_bets - wins
+    win_rate     = wins / total_bets * 100 if total_bets else 0
+    total_staked = bets["stake"].sum()
+    total_pnl    = bets["game_pnl"].sum()
+    roi          = total_pnl / total_staked * 100 if total_staked else 0
+    final_bk     = df["bankroll"].iloc[-1] if not df.empty else STARTING_BANKROLL
+    avg_edge     = bets["edge"].mean() * 100 if total_bets else 0
+    avg_stake    = bets["stake"].mean() if total_bets else 0
+
+    print(f"\n{'='*50}")
+    print(f"  2025 MLB BACKTEST RESULTS (hold-out year)")
+    print(f"{'='*50}")
+    print(f"  Season games processed : {total_games}")
+    print(f"  Games with odds        : {df['vegas_prob'].notna().sum()}")
+    print(f"  Bets placed            : {total_bets}")
+    print(f"  No-bet games           : {total_games - total_bets}")
+    print(f"{'─'*50}")
+    print(f"  Win / Loss             : {wins}W – {losses}L")
+    print(f"  Win rate               : {win_rate:.1f}%")
+    print(f"  Avg edge (bet games)   : {avg_edge:.1f}%")
+    print(f"  Avg stake              : ${avg_stake:.2f}")
+    print(f"{'─'*50}")
+    print(f"  Total staked           : ${total_staked:.2f}")
+    print(f"  Total P&L              : ${total_pnl:+.2f}")
+    print(f"  ROI                    : {roi:+.1f}%")
+    print(f"{'─'*50}")
+    print(f"  Starting bankroll      : ${STARTING_BANKROLL:.2f}")
+    print(f"  Ending bankroll        : ${final_bk:.2f}")
+    print(f"  Bankroll return        : {(final_bk - STARTING_BANKROLL) / STARTING_BANKROLL * 100:+.1f}%")
+    print(f"{'='*50}")
+
+    if not bets.empty:
+        bets["month"] = pd.to_datetime(bets["date"]).dt.strftime("%Y-%m")
+        monthly = (bets.groupby("month")
+                       .agg(n=("stake","count"), wins=("won","sum"),
+                            staked=("stake","sum"), pnl=("game_pnl","sum"))
+                       .reset_index())
+        monthly["roi"] = monthly["pnl"] / monthly["staked"] * 100
+        print(f"\n  Monthly breakdown:")
+        for _, r in monthly.iterrows():
+            l = int(r["n"]) - int(r["wins"])
+            print(f"    {r['month']}  {int(r['n']):3} bets  "
+                  f"{int(r['wins'])}W-{l}L  "
+                  f"staked ${r['staked']:6.2f}  "
+                  f"P&L ${r['pnl']:+7.2f}  ROI {r['roi']:+5.1f}%")
+
+
+if __name__ == "__main__":
+    print("Loading model and data…")
+    df = run_backtest()
+    print_summary(df)
+    out = os.path.join(DATA_DIR, "backtest_2025_kelly.csv")
+    df.to_csv(out, index=False)
+    print(f"\n  Full results saved → {out}")

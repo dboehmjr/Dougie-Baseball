@@ -40,18 +40,45 @@ date,home,away,home_sp,away_sp,model_home_prob,vegas_home_prob,pick,home_score,a
 2026-05-01,OAK,CLE,J.T. Ginn,Joey Cantillo,0.557,0.5124,OAK,5.0,8.0,0.0,False
 2026-05-01,SDP,CHW,Germán Márquez,Noah Schultz,0.3322,0.5669,CHW,2.0,8.0,0.0,True
 2026-05-01,SEA,KCR,Bryan Woo,Cole Ragans,0.5567,0.5838,SEA,6.0,7.0,0.0,False
-2026-05-02,NYY,BAL,Ryan Weathers,TBD,0.5518,0.5824,NYY,,,,
-2026-05-02,MIN,TOR,Connor Prielipp,Dylan Cease,0.4251,0.4533,TOR,,,,
-2026-05-02,CHC,ARI,Shota Imanaga,Ryne Nelson,0.5518,0.5934,CHC,,,,
-2026-05-02,OAK,CLE,Jacob Lopez,Slade Cecconi,0.6239,0.5583,OAK,,,,
-2026-05-02,PIT,CIN,Carmen Mlodzinski,Rhett Lowder,0.5329,0.553,PIT,,,,
-2026-05-02,WSN,MIL,Foster Griffin,Kyle Harrison,0.4262,0.463,MIL,,,,
-2026-05-02,BOS,HOU,Connelly Early,Spencer Arrighetti,0.5361,0.537,BOS,,,,
-2026-05-02,MIA,PHI,Max Meyer,TBD,0.4956,,PHI,,,,
-2026-05-02,TBR,SFG,TBD,Landen Roupp,0.5164,,TBR,,,,
-2026-05-02,STL,LAD,Michael McGreevy,Roki Sasaki,0.5125,0.4365,STL,,,,
-2026-05-02,DET,TEX,Keider Montero,Kumar Rocker,0.5874,0.537,DET,,,,
+2026-05-02,NYY,BAL,Ryan Weathers,TBD,0.5518,0.5824,NYY,9.0,4.0,1.0,True
+2026-05-02,MIN,TOR,Connor Prielipp,Dylan Cease,0.4251,0.4533,TOR,4.0,11.0,0.0,True
+2026-05-02,CHC,ARI,Shota Imanaga,Ryne Nelson,0.5518,0.5934,CHC,2.0,0.0,1.0,True
+2026-05-02,OAK,CLE,Jacob Lopez,Slade Cecconi,0.6239,0.5583,OAK,6.0,14.0,0.0,False
+2026-05-02,PIT,CIN,Carmen Mlodzinski,Rhett Lowder,0.5329,0.553,PIT,17.0,7.0,1.0,True
+2026-05-02,WSN,MIL,Foster Griffin,Kyle Harrison,0.4262,0.463,MIL,1.0,4.0,0.0,True
+2026-05-02,BOS,HOU,Connelly Early,Spencer Arrighetti,0.5361,0.537,BOS,3.0,6.0,0.0,False
+2026-05-02,MIA,PHI,Max Meyer,TBD,0.4956,,PHI,4.0,0.0,1.0,False
+2026-05-02,TBR,SFG,TBD,Landen Roupp,0.5164,,TBR,5.0,1.0,1.0,True
+2026-05-02,STL,LAD,Michael McGreevy,Roki Sasaki,0.5125,0.4365,STL,3.0,2.0,1.0,False
+2026-05-02,DET,TEX,Keider Montero,Kumar Rocker,0.5874,0.537,DET,5.0,1.0,1.0,True
 2026-05-02,COL,ATL,TBD,Chris Sale,0.4857,,ATL,,,,
 2026-05-02,SDP,CHW,Michael King,Sean Burke,0.6262,0.6361,SDP,,,,
 2026-05-02,LAA,NYM,Reid Detmers,Nolan McLean,0.4156,0.4573,NYM,,,,
 2026-05-02,SEA,KCR,Emerson Hancock,Seth Lugo,0.542,0.5934,SEA,,,,
+2026-05-03,MIN,TOR,Joe Ryan,Trey Yesavage,0.515,0.5044,MIN,4.0,3.0,1.0,False
+2026-05-03,BOS,HOU,Ranger Suarez,Cody Bolton,0.6088,0.5635,BOS,1.0,3.0,0.0,False
+2026-05-03,PIT,CIN,Braxton Ashcraft,Chase Burns,0.5289,0.5226,PIT,1.0,0.0,1.0,False
+2026-05-03,NYY,BAL,Max Fried,Trey Gibson,0.746,0.6517,NYY,11.0,3.0,1.0,True
+2026-05-03,WSN,MIL,Zack Littell,TBD,0.3926,0.4486,MIL,3.0,2.0,1.0,False
+2026-05-03,TBR,SFG,Steven Matz,Tyler Mahle,0.5543,0.5211,TBR,2.0,1.0,1.0,True
+2026-05-03,MIA,PHI,Chris Paddack,Jesús Luzardo,0.3949,0.4331,PHI,2.0,7.0,0.0,True
+2026-05-03,STL,LAD,Dustin May,Justin Wrobleski,0.3872,0.4331,LAD,1.0,4.0,0.0,True
+2026-05-03,CHC,ARI,Matthew Boyd,Merrill Kelly,0.6211,0.5873,CHC,8.0,4.0,1.0,True
+2026-05-03,COL,ATL,Kyle Freeland,Spencer Strider,0.4187,0.388,ATL,6.0,11.0,0.0,True
+2026-05-03,OAK,CLE,Aaron Civale,Parker Messick,0.452,0.4826,CLE,7.0,1.0,1.0,True
+2026-05-03,LAA,NYM,Jack Kochanowicz,Clay Holmes,0.4223,0.456,NYM,1.0,5.0,0.0,False
+2026-05-03,SEA,KCR,Luis Castillo,Kris Bubic,0.5289,0.5297,SEA,1.0,4.0,0.0,False
+2026-05-03,SDP,CHW,TBD,Anthony Kay,0.7006,0.616,SDP,4.0,3.0,1.0,True
+2026-05-03,DET,TEX,Tyler Holton,Jack Leiter,0.5367,,DET,7.0,1.0,1.0,True
+2026-05-04,COL,NYM,Tomoyuki Sugano,TBD,0.4932,0.4365,NYM,,,,
+2026-05-04,DET,BOS,Tarik Skubal,Payton Tolle,0.6052,0.6729,DET,,,,
+2026-05-04,TBR,TOR,Nick Martinez,TBD,0.5859,0.5261,TBR,,,,
+2026-05-04,MIA,PHI,Janson Junk,Aaron Nola,0.4828,0.4892,PHI,,,,
+2026-05-04,NYY,BAL,Cam Schlittler,Shane Baz,0.6909,0.674,NYY,,,,
+2026-05-04,CHC,CIN,Edward Cabrera,Chase Petty,0.5904,0.6459,CHC,,,,
+2026-05-04,KCR,CLE,Michael Wacha,Tanner Bibee,0.503,0.5325,KCR,,,,
+2026-05-04,STL,MIL,Kyle Leahy,Chad Patrick,0.4923,0.4833,MIL,,,,
+2026-05-04,HOU,LAD,Steven Okert,Yoshinobu Yamamoto,0.416,0.3541,LAD,,,,
+2026-05-04,LAA,CHW,José Soriano,Davis Martin,0.6166,0.5961,LAA,,,,
+2026-05-04,SEA,ATL,Logan Gilbert,JR Ritchie,0.5548,0.581,SEA,,,,
+2026-05-04,SFG,SDP,Trevor McDonald,Randy Vásquez,0.5253,0.4301,SFG,,,,
