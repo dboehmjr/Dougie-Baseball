@@ -9,23 +9,32 @@ Pages:
 
 import os
 import re
+import shutil
 import sys
 import unicodedata
 import warnings
 import requests
 import zoneinfo
 from datetime import date, timedelta, datetime
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 warnings.filterwarnings("ignore")
-sys.path.insert(0, os.path.dirname(__file__))
+BASE_DIR = os.path.dirname(__file__)
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.environ.setdefault("PYBASEBALL_CACHE", os.path.join(LOG_DIR, "pybaseball_cache"))
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(LOG_DIR, "matplotlib_cache"))
+os.makedirs(os.environ["PYBASEBALL_CACHE"], exist_ok=True)
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+sys.path.insert(0, BASE_DIR)
 from predict import predict_matchup
 from fetch_odds import load_or_fetch_odds, get_home_implied_prob, get_moneyline_str
 from fetch_lineups import fetch_confirmed_lineups
 from fetch_weather import wind_to_cf, FULL_DOME
+from fetch_pitcher_stuff import get_pitcher_stuff
 from betting_strategy import choose_bet, load_policy
 
 # ---------------------------------------------------------------------------
@@ -37,19 +46,24 @@ BREAKEVEN  = JUICE / (JUICE + 100)
 
 ALL_TEAMS = [
     "ARI","ATL","BAL","BOS","CHC","CHW","CIN","CLE","COL","DET",
-    "HOU","KCR","LAA","LAD","MIA","MIL","MIN","NYM","NYY","OAK",
+    "HOU","KCR","LAA","LAD","MIA","MIL","MIN","NYM","NYY","ATH",
     "PHI","PIT","SDP","SEA","SFG","STL","TBR","TEX","TOR","WSN",
 ]
 
 MLB_API_MAP = {
     "WSH": "WSN", "SD": "SDP", "TB": "TBR",
     "KC": "KCR", "AZ": "ARI", "SF": "SFG",
-    "ATH": "OAK", "CWS": "CHW",
+    "OAK": "ATH", "ATH": "ATH", "CWS": "CHW",
 }
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
 LEDGER_PATH = os.path.join(DATA_DIR, "bankroll_ledger.csv")
+USER_HISTORY_BACKUP_DIR = os.environ.get(
+    "BASEBALL_USER_HISTORY_BACKUP_DIR",
+    "/Users/dougboehm/Library/CloudStorage/GoogleDrive-dboehmjr@gmail.com/"
+    "My Drive/Baseball Code Backups/Betting History",
+)
 BETTING_POLICY_PATH = os.path.join(MODELS_DIR, "betting_policy.json")
 
 
@@ -165,10 +179,10 @@ def get_prediction(home: str, away: str, year: int, game_date: str,
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def load_odds_for_date(game_date: str) -> pd.DataFrame:
+def load_odds_for_date(game_date: str, expected_games: Optional[int] = None) -> pd.DataFrame:
     """Load Vegas moneylines for a game date (cached 15 min)."""
     try:
-        return load_or_fetch_odds(game_date=game_date)
+        return load_or_fetch_odds(game_date=game_date, expected_games=expected_games)
     except Exception as e:
         st.warning(f"Could not load Vegas odds for {game_date}: {e}")
         return pd.DataFrame()
@@ -210,22 +224,20 @@ def _normalize_sp_name(name: str) -> str:
 
 
 def get_sp_stats(name: str, team: str, year: int, stuff_df: pd.DataFrame) -> dict:
-    """Look up pitcher stats from stuff_df by normalized name + year."""
+    """Look up the same blended pitcher-stuff values used by predict_matchup."""
     if stuff_df.empty or not name or name == "TBD":
         return {}
     normalized = _normalize_sp_name(name)
-    mask = (stuff_df["name_norm"] == normalized) & (stuff_df["year"] == year)
-    if not mask.any():
-        # Try last-name fallback
-        last = normalized.split()[-1]
-        mask = (stuff_df["name_norm"].str.contains(last, na=False)) & (stuff_df["year"] == year)
-    if not mask.any():
-        # Prior year
-        mask = stuff_df["name_norm"] == normalized
-    if not mask.any():
-        return {}
-    row = stuff_df[mask].sort_values("year", ascending=False).iloc[0]
-    result = {"hand": row.get("Throws", "")}
+    team = str(team).upper()
+    # Match live prediction: current-season SP stuff is used when there is
+    # enough PA; small samples are blended by get_pitcher_stuff.
+    stuff_year = year
+    row = get_pitcher_stuff(normalized, team, stuff_year, stuff_df)
+    result = {
+        "hand": row.get("Throws", "") or "",
+        "source_year": stuff_year,
+        "source_team": team,
+    }
     for col in ["xFIP", "FBv", "SwStr_pct", "K_pct", "GS", "pa"]:
         val = row.get(col)
         if pd.notna(val):
@@ -266,22 +278,35 @@ def generate_key_factors(r: dict, home_stuff: dict, away_stuff: dict,
     if h_xfip and a_xfip:
         diff = a_xfip - h_xfip
         if diff >= 0.5:
+            prefix = "Pitching edge" if pick == home else "Pitching concern"
             factors.append(
-                f"Pitching edge: {r['home_sp']} has lower xFIP than {r['away_sp']} "
-                f"({h_xfip:.2f} vs {a_xfip:.2f})"
+                f"{prefix}: {home} starter {r['home_sp']} has lower xFIP than "
+                f"{away} starter {r['away_sp']} ({h_xfip:.2f} vs {a_xfip:.2f})"
             )
         elif diff <= -0.5:
+            prefix = "Pitching edge" if pick == away else "Pitching concern"
             factors.append(
-                f"Pitching edge: {r['away_sp']} has lower xFIP than {r['home_sp']} "
-                f"({a_xfip:.2f} vs {h_xfip:.2f})"
+                f"{prefix}: {away} starter {r['away_sp']} has lower xFIP than "
+                f"{home} starter {r['home_sp']} ({a_xfip:.2f} vs {h_xfip:.2f})"
             )
 
     # Market edge
-    edge = r.get("model_edge", 0) or 0
-    if abs(edge) >= 0.05:
-        dir_ = "above" if edge > 0 else "below"
+    edge = r.get("pick_edge", 0) or 0
+    if edge >= 0.05:
         factors.append(
-            f"Market edge: model is {abs(edge):.1%} {dir_} Vegas on {pick}"
+            f"Market edge: model is {edge:.1%} above Vegas on {pick}"
+        )
+        if r.get("conf", 0) < 0.55:
+            vegas_pick = r.get("vegas_prob", np.nan)
+            if pick == away and not pd.isna(vegas_pick):
+                vegas_pick = 1 - vegas_pick
+            factors.append(
+                f"Value play, not a strong favorite: model has {pick} "
+                f"{r['conf']:.1%} vs Vegas {vegas_pick:.1%}"
+            )
+    elif edge <= -0.05:
+        factors.append(
+            f"Market caution: model is {abs(edge):.1%} below Vegas on {pick}"
         )
 
     # Team momentum / streaks
@@ -338,6 +363,19 @@ PRED_LOG_COLS = [
 ]
 
 
+def backup_user_history_file(path: str, stem: str) -> None:
+    """Keep an immediate Google Drive shadow copy of hand-entered app history."""
+    if not os.path.exists(path):
+        return
+    try:
+        os.makedirs(USER_HISTORY_BACKUP_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        shutil.copy2(path, os.path.join(USER_HISTORY_BACKUP_DIR, f"{stem}_latest.csv"))
+        shutil.copy2(path, os.path.join(USER_HISTORY_BACKUP_DIR, f"{stem}_{ts}.csv"))
+    except Exception as exc:
+        print(f"WARNING: Could not back up {path} to Google Drive: {exc}")
+
+
 def load_pred_log() -> pd.DataFrame:
     if os.path.exists(PRED_LOG_PATH):
         return pd.read_csv(PRED_LOG_PATH, parse_dates=["date"])
@@ -346,6 +384,7 @@ def load_pred_log() -> pd.DataFrame:
 
 def save_pred_log(df: pd.DataFrame) -> None:
     df.to_csv(PRED_LOG_PATH, index=False)
+    backup_user_history_file(PRED_LOG_PATH, "predictions_log")
 
 
 def log_or_update_predictions(rows: list, game_date: str) -> int:
@@ -468,6 +507,7 @@ def load_ledger() -> pd.DataFrame:
 
 def save_ledger(df: pd.DataFrame):
     df.to_csv(LEDGER_PATH, index=False)
+    backup_user_history_file(LEDGER_PATH, "bankroll_ledger")
 
 
 def pnl_from_odds(stake: float, odds: float, won: bool) -> float:
@@ -525,7 +565,7 @@ def auto_log_bets(bet_rows: list, ledger: pd.DataFrame, game_date: str) -> tuple
         new_rows.append({
             "date":     log_date,
             "matchup":  matchup,
-            "bet_side": r["pick"],
+            "bet_side": r.get("bet_side", r["pick"]),
             "stake":    stake,
             "odds":     odds,
             "won":      won,
@@ -764,7 +804,7 @@ with tab1:
     # Load team form, transactions, odds, pitcher stuff, lineups, and weather once per page load
     team_form    = load_team_form()
     transactions = load_transactions(days_back=7)
-    odds_df      = load_odds_for_date(date_str)
+    odds_df      = load_odds_for_date(date_str, expected_games=len(schedule))
     stuff_df     = load_pitcher_stuff()
     lineups_df   = load_lineups_for_date(date_str)
     weather_df   = load_weather_data()
@@ -792,6 +832,7 @@ with tab1:
 
             p_away  = 1 - p_home
             conf    = max(p_home, p_away)
+            model_pick = home if p_home >= p_away else away
 
             # Get Vegas implied probs and moneylines
             pick_odds = -110
@@ -886,10 +927,12 @@ with tab1:
             ml_str     = get_moneyline_str(home, away, odds_df)
             if np.isnan(vegas_prob):
                 model_edge = np.nan
-            elif bet_side == home:
-                model_edge = p_home - vegas_prob
+                pick_edge = np.nan
+                pick_vegas_prob = np.nan
             else:
-                model_edge = p_away - (1 - vegas_prob)
+                model_edge = p_home - vegas_prob
+                pick_vegas_prob = vegas_prob if model_pick == home else (1 - vegas_prob)
+                pick_edge = (p_home if model_pick == home else p_away) - pick_vegas_prob
 
             rows.append({
                 "signal":     confidence_color(conf),
@@ -902,7 +945,9 @@ with tab1:
                 "live_str":   g.get("live_str",  "TBD"),
                 "home%":      p_home,
                 "away%":      p_away,
-                "pick":       bet_side,
+                "pick":       model_pick,
+                "bet_side":   bet_side,
+                "bet_prob":   bet_p,
                 "conf":       conf,
                 "stake":      stake,
                 "to_win":     to_win,
@@ -915,6 +960,8 @@ with tab1:
                 "vegas_prob":    vegas_prob,
                 "ml_str":        ml_str,
                 "model_edge":    model_edge,
+                "pick_edge":     pick_edge,
+                "pick_vegas_prob": pick_vegas_prob,
                 "odds_bucket":   odds_bucket,
                 "season_phase":  season_phase,
                 "policy_reason": policy_reason,
@@ -960,29 +1007,41 @@ with tab1:
                 "Matchup":   f"{away_str} @ {home_str}",
                 "Pitchers":  f"{r['away_sp']} vs {r['home_sp']}",
                 "Lineups":   r["lineup_status"],
-                "Home%":     f"{r['home%']:.1%}",
-                "Away%":     f"{r['away%']:.1%}",
-                "Pick":      r["pick"],
-                "Conf":      f"{r['conf']:.1%}",
-                "Stake":     f"${r['stake']:.2f}" if r["has_edge"] else "—",
-                "Payout":    f"${r['to_win']:.2f}" if r["has_edge"] else "—",
+                "Home%":     r["home%"] * 100,
+                "Away%":     r["away%"] * 100,
+                "Model Pick": r["pick"],
+                "Model Conf": r["conf"] * 100,
+                "Stake":     r["stake"] if r["has_edge"] else None,
+                "Payout":    r["to_win"] if r["has_edge"] else None,
             }
             if has_odds and not np.isnan(r.get("vegas_prob", np.nan)):
                 row["Vegas"] = r["ml_str"]
-                vegas_pick_prob = r["vegas_prob"] if r["pick"] == r["home"] else (1 - r["vegas_prob"])
-                row["Vegas Pick%"] = f"{vegas_pick_prob:.1%}"
-                edge = r["model_edge"]
-                row["Edge"] = f"{edge:+.1%}" if not np.isnan(edge) else "—"
-                row["Bucket"] = r.get("odds_bucket") or "—"
+                row["Vegas Pick%"] = r.get("pick_vegas_prob", np.nan) * 100
+                edge = r["pick_edge"]
+                row["Edge"] = edge * 100 if not np.isnan(edge) else None
             if has_finals:
                 row["Result"] = r["result"] if r["result"] else "Pending"
-                row["P&L"]    = f"${r['pnl']:+.2f}" if r["pnl"] is not None else "—"
+                row["P&L"]    = r["pnl"] if r["pnl"] is not None else None
             display.append(row)
 
-        st.dataframe(pd.DataFrame(display), use_container_width=True, hide_index=True)
+        st.dataframe(
+            pd.DataFrame(display),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Home%":       st.column_config.NumberColumn("Home%", format="%.1f%%"),
+                "Away%":       st.column_config.NumberColumn("Away%", format="%.1f%%"),
+                "Model Conf":  st.column_config.NumberColumn("Model Conf", format="%.1f%%"),
+                "Vegas Pick%": st.column_config.NumberColumn("Vegas Pick%", format="%.1f%%"),
+                "Edge":        st.column_config.NumberColumn("Edge", format="%+.1f%%"),
+                "Stake":       st.column_config.NumberColumn("Stake", format="$%.2f"),
+                "Payout":      st.column_config.NumberColumn("Payout", format="$%.2f"),
+                "P&L":         st.column_config.NumberColumn("P&L", format="$%+.2f"),
+            },
+        )
 
         if bets:
-            odds_note = "  |  Edge = model% − Vegas%" if has_odds else "  |  Set ODDS_API_KEY for Vegas lines"
+            odds_note = "  |  Edge = Model Pick% − Vegas Pick%" if has_odds else "  |  Set ODDS_API_KEY for Vegas lines"
             st.caption(
                 f"🟢 ≥65% confidence  🟡 58–65%  ⚪ 53–58%  |  "
                 f"🔥 heating up  ❄️ cooling down  |  "
@@ -1007,7 +1066,13 @@ with tab1:
         for r in show_rows:
             edge_flag = "🎯 " if r["has_edge"] else ""
             pick_pct  = f"{r['conf']:.1%}"
-            label     = f"{edge_flag}{r['away']} @ {r['home']}  —  {r['live_str']}  |  Pick: **{r['pick']}** {pick_pct}"
+            edge_txt = ""
+            if r["has_edge"] and not np.isnan(r.get("model_edge", np.nan)):
+                edge_txt = f" | Bet: **{r.get('bet_side')}** ({r['model_edge']:+.1%} edge)"
+            label = (
+                f"{edge_flag}{r['away']} @ {r['home']}  —  {r['live_str']}  |  "
+                f"Model: **{r['pick']}** {pick_pct}{edge_txt}"
+            )
             with st.expander(label, expanded=False):
                 home_stuff = get_sp_stats(r["home_sp"], r["home"], year, stuff_df)
                 away_stuff = get_sp_stats(r["away_sp"], r["away"], year, stuff_df)
@@ -1015,7 +1080,7 @@ with tab1:
 
                 # ── Key factors ──────────────────────────────────
                 factors = generate_key_factors(r, home_stuff, away_stuff, team_form, weather, year)
-                st.markdown("**Why this pick:**")
+                st.markdown("**Key factors:**")
                 for f in factors:
                     st.markdown(f"&nbsp;&nbsp;• {f}")
 
@@ -1035,8 +1100,10 @@ with tab1:
                         swstr  = f"{stuff['SwStr_pct']*100:.1f}%" if "SwStr_pct" in stuff else "—"
                         fbv    = f"{stuff['FBv']:.1f}" if "FBv" in stuff else "—"
                         gs     = f"{int(stuff['GS'])} GS" if "GS" in stuff else ""
+                        src_year = stuff.get("source_year")
+                        src_note = f" ({src_year})" if src_year else ""
                         st.markdown(
-                            f"**{side}** — {sp_name} ({hand})  \n"
+                            f"**{side}** — {sp_name} ({hand}){src_note}  \n"
                             f"xFIP: `{xfip}` &nbsp; K%: `{kpct}` &nbsp; SwStr%: `{swstr}`  \n"
                             f"FB: `{fbv} mph` &nbsp; {gs}"
                         )
@@ -1087,7 +1154,9 @@ with tab1:
                     st.markdown(
                         f"Model: `{r['away']} {ap:.1%}` vs `{r['home']} {hp:.1%}`  \n"
                         + (f"Vegas:  `{r['away']} {1-vp:.1%}` vs `{r['home']} {vp:.1%}`  \n" if not np.isnan(vp) else "")
-                        + (f"Edge on **{r['pick']}**: `{r['model_edge']:+.1%}`  \n" if not np.isnan(r.get("model_edge") or np.nan) else "")
+                        + (f"Edge on model pick **{r['pick']}**: `{r['pick_edge']:+.1%}`  \n" if not np.isnan(r.get("pick_edge") or np.nan) else "")
+                        + (f"Bet side: **{r.get('bet_side')}** `{r.get('bet_prob', np.nan):.1%}` "
+                           f"(`{r['model_edge']:+.1%}` edge)  \n" if r["has_edge"] else "")
                         + f"Policy: `{r.get('policy_reason', 'n/a')}`"
                     )
 
@@ -1316,9 +1385,6 @@ with tab3:
             st.success("Changes saved and bankroll recalculated!")
             st.rerun()
 
-        if st.button("🗑️ Clear ALL data", key="clear_ledger"):
-            os.remove(LEDGER_PATH)
-            st.rerun()
     else:
         st.info("No bets yet. Use **📥 Log Today's Bets** on the Today's Slate tab, or add one manually above.")
 
@@ -1334,6 +1400,17 @@ with tab_acc:
     )
 
     pred_log = load_pred_log()
+    if not pred_log.empty:
+        ungraded_dates = pd.to_datetime(
+            pred_log.loc[pred_log["home_win"].isna(), "date"],
+            errors="coerce",
+        ).dt.normalize()
+        has_past_ungraded = (ungraded_dates < pd.Timestamp.today().normalize()).any()
+        if has_past_ungraded:
+            before = pred_log.copy()
+            pred_log = _grade_past_predictions(pred_log)
+            if not pred_log.equals(before):
+                save_pred_log(pred_log)
 
     if st.button("🔄 Grade Ungraded Past Games", key="grade_past"):
         with st.spinner("Fetching final scores…"):

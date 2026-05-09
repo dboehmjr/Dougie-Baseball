@@ -47,7 +47,8 @@ AN_ABBREV_MAP = {
     "WSH": "WSN",
     "CWS": "CHW",
     "AZ":  "ARI",
-    "ATH": "OAK",
+    "OAK": "ATH",
+    "ATH": "ATH",
 }
 
 

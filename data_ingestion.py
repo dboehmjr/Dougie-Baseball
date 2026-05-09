@@ -56,7 +56,7 @@ def fetch_all_game_logs(years: list[int], cache_path: str | None = None) -> pd.D
 
     teams = [
         "ARI","ATL","BAL","BOS","CHC","CHW","CIN","CLE","COL","DET",
-        "HOU","KCR","LAA","LAD","MIA","MIL","MIN","NYM","NYY","OAK",
+        "HOU","KCR","LAA","LAD","MIA","MIL","MIN","NYM","NYY","ATH",
         "PHI","PIT","SDP","SEA","SFG","STL","TBR","TEX","TOR","WSN",
     ]
 

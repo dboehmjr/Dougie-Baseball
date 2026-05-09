@@ -48,7 +48,7 @@ MLB_API = "https://statsapi.mlb.com/api/v1"
 ABBREV_MAP = {
     "WSH": "WSN", "SD":  "SDP", "TB":  "TBR",
     "KC":  "KCR", "SF":  "SFG", "CWS": "CHW",
-    "AZ":  "ARI", "LAA": "LAA", "ATH": "OAK",
+    "AZ":  "ARI", "LAA": "LAA", "OAK": "ATH", "ATH": "ATH",
 }
 
 

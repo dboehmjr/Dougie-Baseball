@@ -12,6 +12,7 @@ Features used:
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -21,6 +22,7 @@ import numpy as np
 
 # Import weather helpers (park CF bearings + wind projection)
 from fetch_weather import PARK_CF_BEARING, FULL_DOME, wind_to_cf
+from fetch_pitcher_stuff import get_pitcher_stuff
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
@@ -40,7 +42,8 @@ BREF_NAME_TO_ABBREV = {
     "los angeles dodgers": "LAD", "miami marlins": "MIA",
     "milwaukee brewers": "MIL", "minnesota twins": "MIN",
     "new york mets": "NYM", "new york yankees": "NYY",
-    "oakland athletics": "OAK", "philadelphia phillies": "PHI",
+    "oakland athletics": "ATH", "athletics": "ATH",
+    "philadelphia phillies": "PHI",
     "pittsburgh pirates": "PIT", "san diego padres": "SDP",
     "seattle mariners": "SEA", "san francisco giants": "SFG",
     "st. louis cardinals": "STL", "tampa bay rays": "TBR",
@@ -53,7 +56,7 @@ BREF_NAME_TO_ABBREV = {
     "houston": "HOU", "kansas city": "KCR", "la angels": "LAA",
     "la dodgers": "LAD", "miami": "MIA", "milwaukee": "MIL",
     "minnesota": "MIN", "ny mets": "NYM", "ny yankees": "NYY",
-    "oakland": "OAK", "philadelphia": "PHI", "pittsburgh": "PIT",
+    "oakland": "ATH", "philadelphia": "PHI", "pittsburgh": "PIT",
     "san diego": "SDP", "seattle": "SEA", "san francisco": "SFG",
     "st. louis": "STL", "tampa bay": "TBR", "texas": "TEX",
     "toronto": "TOR", "washington": "WSN",
@@ -61,7 +64,7 @@ BREF_NAME_TO_ABBREV = {
 
 SCHEDULE_ABBREV_MAP = {
     "CWS": "CHW", "KC": "KCR", "SD": "SDP", "SF": "SFG",
-    "TB": "TBR", "WSH": "WSN",
+    "TB": "TBR", "WSH": "WSN", "OAK": "ATH",
 }
 
 
@@ -73,6 +76,47 @@ def normalize_schedule_team(name: str) -> str:
 def normalize_bref_team(name: str) -> str:
     s = str(name).strip().lower()
     return BREF_NAME_TO_ABBREV.get(s, s.upper())
+
+
+def add_game_identity(games: pd.DataFrame,
+                      date_col: str = "Date",
+                      home_col: str = "home_team",
+                      away_col: str = "away_team") -> pd.DataFrame:
+    """
+    Add doubleheader-safe per-game identity columns.
+
+    game_number is the sequence within a same-date/same-teams doubleheader.
+    game_id is a stable synthetic key used when source files do not share MLB's
+    game_pk or Retrosheet game_id.
+    """
+    out = games.copy()
+    out[date_col] = pd.to_datetime(out[date_col])
+    if "_source_order" not in out.columns:
+        out["_source_order"] = np.arange(len(out))
+    out = out.sort_values([date_col, home_col, away_col, "_source_order"]).copy()
+    out["game_number"] = (
+        out.groupby([date_col, home_col, away_col], dropna=False)
+        .cumcount()
+        .add(1)
+        .astype(int)
+    )
+    out["game_id"] = (
+        out[date_col].dt.strftime("%Y%m%d")
+        + "_"
+        + out[home_col].astype(str)
+        + "_"
+        + out[away_col].astype(str)
+        + "_"
+        + out["game_number"].astype(str)
+    )
+    return out.drop(columns=["_source_order"], errors="ignore")
+
+
+def game_merge_keys(left: pd.DataFrame, right: pd.DataFrame) -> list[str]:
+    keys = ["Date", "home_team", "away_team"]
+    if "game_number" in left.columns and "game_number" in right.columns:
+        keys.append("game_number")
+    return keys
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +143,7 @@ PARK_COORDS: dict[str, tuple[float, float]] = {
     "MIN": (44.9817,  -93.2781),   # Target Field, Minneapolis MN
     "NYM": (40.7571,  -73.8458),   # Citi Field, Queens NY
     "NYY": (40.8296,  -73.9262),   # Yankee Stadium, Bronx NY
-    "OAK": (37.7516, -122.2005),   # Oakland Coliseum, Oakland CA
+    "ATH": (37.7516, -122.2005),   # Athletics historical home park proxy
     "PHI": (39.9061,  -75.1665),   # Citizens Bank Park, Philadelphia PA
     "PIT": (40.4469,  -80.0057),   # PNC Park, Pittsburgh PA
     "SDP": (32.7076, -117.1570),   # Petco Park, San Diego CA
@@ -140,7 +184,7 @@ PARK_DIMENSIONS: dict[str, dict] = {
     "MIN": {"lf_dist": 339, "cf_dist": 411, "rf_dist": 328, "lf_wall_ht":  8.0, "altitude_ft":  841},
     "NYM": {"lf_dist": 335, "cf_dist": 408, "rf_dist": 330, "lf_wall_ht":  8.0, "altitude_ft":   20},
     "NYY": {"lf_dist": 318, "cf_dist": 408, "rf_dist": 314, "lf_wall_ht":  8.0, "altitude_ft":   55},
-    "OAK": {"lf_dist": 330, "cf_dist": 400, "rf_dist": 330, "lf_wall_ht":  8.0, "altitude_ft":   25},
+    "ATH": {"lf_dist": 330, "cf_dist": 400, "rf_dist": 330, "lf_wall_ht":  8.0, "altitude_ft":   25},
     "PHI": {"lf_dist": 329, "cf_dist": 401, "rf_dist": 330, "lf_wall_ht":  6.0, "altitude_ft":   20},
     "PIT": {"lf_dist": 325, "cf_dist": 399, "rf_dist": 320, "lf_wall_ht":  6.0, "altitude_ft":  730},
     "SDP": {"lf_dist": 336, "cf_dist": 396, "rf_dist": 322, "lf_wall_ht":  8.0, "altitude_ft":   20},
@@ -181,6 +225,7 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
 
 def clean_game_logs(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy()
+    df["_source_order"] = np.arange(len(df))
 
     df = df[df["Home_Away"] == "Home"].copy()
     df = df[df["W/L"].str.contains("W|L", na=False)].copy()
@@ -196,12 +241,13 @@ def clean_game_logs(raw: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["Date"])
     df["home_win"] = df["W/L"].str.startswith("W").astype(int)
 
-    return df[["Date", "year", "team", "Opp", "home_win", "R", "RA"]].rename(columns={
+    out = df[["Date", "year", "team", "Opp", "home_win", "R", "RA", "_source_order"]].rename(columns={
         "team": "home_team",
         "Opp":  "away_team",
         "R":    "home_runs",
         "RA":   "away_runs",
     })
+    return add_game_identity(out)
 
 
 # ---------------------------------------------------------------------------
@@ -229,13 +275,15 @@ def _win_streak(run_diff_series: pd.Series) -> pd.Series:
 
 
 def add_rolling_stats(games: pd.DataFrame, window: int = 15) -> pd.DataFrame:
-    home = games[["Date", "home_team", "home_runs", "away_runs"]].copy()
-    home.columns = ["Date", "team", "runs_for", "runs_against"]
+    home = games[["game_id", "Date", "home_team", "home_runs", "away_runs"]].copy()
+    home.columns = ["game_id", "Date", "team", "runs_for", "runs_against"]
+    home["venue"] = "home"
 
-    away = games[["Date", "away_team", "away_runs", "home_runs"]].copy()
-    away.columns = ["Date", "team", "runs_for", "runs_against"]
+    away = games[["game_id", "Date", "away_team", "away_runs", "home_runs"]].copy()
+    away.columns = ["game_id", "Date", "team", "runs_for", "runs_against"]
+    away["venue"] = "away"
 
-    tg = pd.concat([home, away]).sort_values(["team", "Date"]).reset_index(drop=True)
+    tg = pd.concat([home, away]).sort_values(["team", "Date", "game_id"]).reset_index(drop=True)
     tg["run_diff"] = tg["runs_for"] - tg["runs_against"]
 
     grp = tg.groupby("team")
@@ -259,7 +307,6 @@ def add_rolling_stats(games: pd.DataFrame, window: int = 15) -> pd.DataFrame:
     tg = tg.drop(columns=["_streak_after"])
 
     # Current-season running win% (shift-1, reset each calendar year)
-    # Captures teams that are genuinely bad *this* season, not just last year.
     tg["win"] = (tg["run_diff"] > 0).astype(float)
     tg["_year"] = tg["Date"].dt.year
     tg["season_win_pct"] = (
@@ -268,28 +315,46 @@ def add_rolling_stats(games: pd.DataFrame, window: int = 15) -> pd.DataFrame:
     )
     tg = tg.drop(columns=["win", "_year"])
 
-    def merge_side(side_col, rd_col, rs_col, rd7_col, streak_col, swp_col):
+    # Home-venue and away-venue rolling run diff (shift-1 within each venue subset)
+    for venue_tag in ("home", "away"):
+        mask = tg["venue"] == venue_tag
+        sub  = tg[mask].copy()
+        sub[f"rolling_{venue_tag}_rd"] = sub.groupby("team")["run_diff"].transform(
+            lambda s: s.shift(1).rolling(window, min_periods=3).mean()
+        )
+        tg = tg.merge(
+            sub[["team", "game_id", f"rolling_{venue_tag}_rd"]],
+            on=["team", "game_id"], how="left"
+        )
+
+    def merge_side(side_col, rd_col, rs_col, rd7_col, streak_col, swp_col,
+                   h_rd_col, a_rd_col):
         side = tg.merge(
-            games[["Date", side_col]],
-            left_on=["Date", "team"], right_on=["Date", side_col],
+            games[["game_id", side_col]],
+            left_on=["game_id", "team"], right_on=["game_id", side_col],
             how="inner"
-        )[[side_col, "Date", "rolling_run_diff", "rolling_runs_scored",
-           "last7_run_diff", "streak", "season_win_pct"]].rename(columns={
+        )[[side_col, "game_id", "rolling_run_diff", "rolling_runs_scored",
+           "last7_run_diff", "streak", "season_win_pct",
+           "rolling_home_rd", "rolling_away_rd"]].rename(columns={
             "rolling_run_diff":    rd_col,
             "rolling_runs_scored": rs_col,
             "last7_run_diff":      rd7_col,
             "streak":              streak_col,
             "season_win_pct":      swp_col,
-        }).drop_duplicates(["Date", side_col])
+            "rolling_home_rd":     h_rd_col,
+            "rolling_away_rd":     a_rd_col,
+        }).drop_duplicates(["game_id", side_col])
         return side
 
     home_stats = merge_side("home_team", "home_rolling_rd", "home_rolling_rs",
-                             "home_last7_rd", "home_streak", "home_season_win_pct")
+                             "home_last7_rd", "home_streak", "home_season_win_pct",
+                             "home_home_rd", "home_away_rd")
     away_stats = merge_side("away_team", "away_rolling_rd", "away_rolling_rs",
-                             "away_last7_rd", "away_streak", "away_season_win_pct")
+                             "away_last7_rd", "away_streak", "away_season_win_pct",
+                             "away_home_rd", "away_away_rd")
 
-    games = games.merge(home_stats, on=["Date", "home_team"], how="left")
-    games = games.merge(away_stats, on=["Date", "away_team"], how="left")
+    games = games.merge(home_stats, on=["game_id", "home_team"], how="left")
+    games = games.merge(away_stats, on=["game_id", "away_team"], how="left")
     return games
 
 
@@ -475,12 +540,17 @@ def attach_sp_era(games: pd.DataFrame,
     not found.
     """
     gs = game_sp.copy()
+    gs["Date"] = pd.to_datetime(gs["Date"])
+    gs["home_team"] = gs["home_team"].apply(normalize_schedule_team)
+    gs["away_team"] = gs["away_team"].apply(normalize_schedule_team)
+    gs = add_game_identity(gs)
     gs["home_sp_norm"] = gs["home_sp_name"].apply(_normalize_sp_name)
     gs["away_sp_norm"] = gs["away_sp_name"].apply(_normalize_sp_name)
 
+    merge_keys = game_merge_keys(games, gs)
     games = games.merge(
-        gs[["Date", "home_team", "away_team", "home_sp_norm", "away_sp_norm"]],
-        on=["Date", "home_team", "away_team"], how="left"
+        gs[merge_keys + ["home_sp_norm", "away_sp_norm"]],
+        on=merge_keys, how="left"
     )
 
     era_raw = pitcher_era.set_index(["name_norm", "year"])["ERA"]
@@ -585,10 +655,11 @@ def attach_park_factor(games: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # SP pitch stuff (FanGraphs) — fastball velocity, whiff rate, K%, xFIP
 #
-# Joined at the prior-season level: for game in year Y, use the SP's FanGraphs
-# stats from year Y-1. Current-season rolling SP/bullpen features carry the
-# in-year signal without leaking future games. Throws is stored separately so
-# predict.py can look up batting splits.
+# Joined at the prior-season level for historical training: for game in year Y,
+# use the SP's FanGraphs stats from year Y-1. We avoid current-season xFIP,
+# FBv, SwStr%, and K% here because pitcher_stuff.csv stores season-level rows,
+# not as-of-game snapshots, so current-year values would leak future games.
+# Throws is stored separately so predict.py can look up batting splits.
 # ---------------------------------------------------------------------------
 
 def attach_sp_stuff(games: pd.DataFrame,
@@ -607,58 +678,40 @@ def attach_sp_stuff(games: pd.DataFrame,
         return games
 
     stuff = pitcher_stuff.copy()
-    # Pre-compute team medians per year for fallback
-    num_cols = ["FBv", "SwStr_pct", "K_pct", "xFIP"]
-    team_med = (stuff.groupby(["team", "year"])[num_cols]
-                .median().reset_index())
+    hand_cache_path = os.path.join(DATA_DIR, "pitcher_handedness.json")
+    if os.path.exists(hand_cache_path):
+        with open(hand_cache_path) as f:
+            hand_cache = json.load(f)
+    else:
+        hand_cache = {}
 
-    # Build fast lookup dicts
-    def _make_lookup(col):
-        return stuff.dropna(subset=["name_norm", col]).set_index(
-            ["name_norm", "year"])[col].to_dict()
-
-    fbv_lk     = _make_lookup("FBv")
-    swstr_lk   = _make_lookup("SwStr_pct")
-    kpct_lk    = _make_lookup("K_pct")
-    xfip_lk    = _make_lookup("xFIP")
-    pa_lk      = _make_lookup("pa")
-    throws_lk  = (stuff.dropna(subset=["name_norm", "Throws"])
-                       .set_index(["name_norm", "year"])["Throws"].to_dict()
-                  if "Throws" in stuff.columns else {})
-
-    team_fbv    = team_med.set_index(["team", "year"])["FBv"].to_dict()
-    team_swstr  = team_med.set_index(["team", "year"])["SwStr_pct"].to_dict()
-    team_kpct   = team_med.set_index(["team", "year"])["K_pct"].to_dict()
-    team_xfip   = team_med.set_index(["team", "year"])["xFIP"].to_dict()
-
-    def _lookup(name_norm, team, year, direct_lk, fallback_lk):
-        key = (name_norm, year)
-        v = direct_lk.get(key, np.nan)
-        if pd.isna(v):
-            v = fallback_lk.get((team, year), np.nan)
-        return v
+    def _stuff(name_norm, team, year):
+        row = get_pitcher_stuff(
+            name_norm or "",
+            team,
+            int(year) - 1,
+            stuff,
+        )
+        if not row.get("Throws") and name_norm:
+            row["Throws"] = hand_cache.get(name_norm)
+        return row
 
     for side, sp_col, team_col in [("home", "home_sp_norm", "home_team"),
                                     ("away", "away_sp_norm", "away_team")]:
-        yr   = games["year"] - 1
+        yr   = games["year"]
         name = games[sp_col] if sp_col in games.columns else pd.Series([None]*len(games))
         team = games[team_col]
+        rows = [_stuff(n, t, y) for n, t, y in zip(name, team, yr)]
 
-        games[f"{side}_sp_fbv"]    = [_lookup(n, t, y, fbv_lk,    team_fbv)
-                                       for n, t, y in zip(name, team, yr)]
-        games[f"{side}_sp_swstr"]  = [_lookup(n, t, y, swstr_lk,  team_swstr)
-                                       for n, t, y in zip(name, team, yr)]
-        games[f"{side}_sp_k_pct"]  = [_lookup(n, t, y, kpct_lk,   team_kpct)
-                                       for n, t, y in zip(name, team, yr)]
-        games[f"{side}_sp_xfip"]   = [_lookup(n, t, y, xfip_lk,   team_xfip)
-                                       for n, t, y in zip(name, team, yr)]
-        games[f"{side}_sp_pa"]     = [pa_lk.get((n, y), np.nan) if n else np.nan
-                                       for n, y in zip(name, yr)]
-        games[f"{side}_sp_throws"] = [throws_lk.get((n, y)) if n else None
-                                       for n, y in zip(name, yr)]
+        games[f"{side}_sp_fbv"]    = [r.get("FBv", np.nan) for r in rows]
+        games[f"{side}_sp_swstr"]  = [r.get("SwStr_pct", np.nan) for r in rows]
+        games[f"{side}_sp_k_pct"]  = [r.get("K_pct", np.nan) for r in rows]
+        games[f"{side}_sp_xfip"]   = [r.get("xFIP", np.nan) for r in rows]
+        games[f"{side}_sp_pa"]     = [r.get("pa", np.nan) for r in rows]
+        games[f"{side}_sp_throws"] = [r.get("Throws") for r in rows]
 
     cov = games["home_sp_fbv"].notna().mean()
-    print(f"  SP stuff coverage: {cov:.1%}  (FBv)")
+    print(f"  SP stuff coverage: {cov:.1%}  (prior-season, no leakage)")
     return games
 
 
@@ -796,6 +849,9 @@ def compute_sp_workload(game_logs: pd.DataFrame,
 
     gs = game_sp.copy()
     gs["Date"] = pd.to_datetime(gs["Date"])
+    gs["home_team"] = gs["home_team"].apply(normalize_schedule_team)
+    gs["away_team"] = gs["away_team"].apply(normalize_schedule_team)
+    gs = add_game_identity(gs)
 
     work = starters[["game_date", "pitcher_id", "sp_days_rest", "sp_outs_last"]]
 
@@ -815,9 +871,10 @@ def compute_sp_workload(game_logs: pd.DataFrame,
 
     cov = result["home_sp_days_rest"].notna().mean()
     print(f"  SP workload coverage: {cov:.1%}  (days rest + outs last start)")
-    return result[["Date", "home_team", "away_team",
+    cols = ["Date", "home_team", "away_team", "game_number",
                    "home_sp_days_rest", "away_sp_days_rest",
-                   "home_sp_outs_last", "away_sp_outs_last"]]
+                   "home_sp_outs_last", "away_sp_outs_last"]
+    return result[[c for c in cols if c in result.columns]]
 
 
 def compute_inseason_sp_era(game_logs: pd.DataFrame,
@@ -843,32 +900,45 @@ def compute_inseason_sp_era(game_logs: pd.DataFrame,
     starters["roll_outs"] = grp["outs_recorded"].transform(
         lambda s: s.shift(1).rolling(n_starts, min_periods=2).sum()
     )
-    starters["sp_inseason_ra9"] = starters.apply(
-        lambda r: _ra9(r["roll_runs"], r["roll_outs"]), axis=1
+    # Last-3-starts window (more recent form signal)
+    starters["roll_runs_3"] = grp["runs_allowed"].transform(
+        lambda s: s.shift(1).rolling(3, min_periods=2).sum()
     )
+    starters["roll_outs_3"] = grp["outs_recorded"].transform(
+        lambda s: s.shift(1).rolling(3, min_periods=2).sum()
+    )
+    starters["sp_inseason_ra9"]   = starters.apply(lambda r: _ra9(r["roll_runs"],   r["roll_outs"]),   axis=1)
+    starters["sp_last3_ra9"]      = starters.apply(lambda r: _ra9(r["roll_runs_3"], r["roll_outs_3"]), axis=1)
 
-    # Park-adjust: RA9 → park-adjusted RA9
+    # Park-adjust both windows
     pf_lookup = park_factors.set_index(["home_team", "year"])["park_factor"]
 
     def park_adj_sp(row):
-        ra9 = row["sp_inseason_ra9"]
-        if np.isnan(ra9):
-            return np.nan
-        # Pitcher's home park — use their team_side + game teams
         pitcher_team = row["home_team"] if row["team_side"] == 1 else row["away_team"]
         year = row["game_date"].year
-        pf = pf_lookup.get((pitcher_team, year), np.nan)
-        return _park_adjust_era(ra9, pf)
+        pf   = pf_lookup.get((pitcher_team, year), np.nan)
+        return (
+            _park_adjust_era(row["sp_inseason_ra9"], pf),
+            _park_adjust_era(row["sp_last3_ra9"],    pf),
+        )
 
-    starters["sp_inseason_era_adj"] = starters.apply(park_adj_sp, axis=1)
+    adj = starters.apply(park_adj_sp, axis=1, result_type="expand")
+    starters["sp_inseason_era_adj"] = adj[0]
+    starters["sp_last3_era_adj"]    = adj[1]
 
     # Merge SP assignments to get pitcher_id per game
     gs = game_sp.copy()
     gs["Date"] = pd.to_datetime(gs["Date"])
+    gs["home_team"] = gs["home_team"].apply(normalize_schedule_team)
+    gs["away_team"] = gs["away_team"].apply(normalize_schedule_team)
+    gs = add_game_identity(gs)
 
     # Join home SP stats
-    home_sp = starters[["game_date", "pitcher_id", "sp_inseason_era_adj"]].rename(
-        columns={"game_date": "Date", "sp_inseason_era_adj": "home_sp_inseason_era"}
+    home_sp = starters[["game_date", "pitcher_id",
+                         "sp_inseason_era_adj", "sp_last3_era_adj"]].rename(
+        columns={"game_date": "Date",
+                 "sp_inseason_era_adj": "home_sp_inseason_era",
+                 "sp_last3_era_adj":    "home_sp_last3_era"}
     )
     result = gs.merge(
         home_sp,
@@ -878,8 +948,11 @@ def compute_inseason_sp_era(game_logs: pd.DataFrame,
     ).drop(columns=["pitcher_id"])
 
     # Join away SP stats
-    away_sp = starters[["game_date", "pitcher_id", "sp_inseason_era_adj"]].rename(
-        columns={"game_date": "Date", "sp_inseason_era_adj": "away_sp_inseason_era"}
+    away_sp = starters[["game_date", "pitcher_id",
+                         "sp_inseason_era_adj", "sp_last3_era_adj"]].rename(
+        columns={"game_date": "Date",
+                 "sp_inseason_era_adj": "away_sp_inseason_era",
+                 "sp_last3_era_adj":    "away_sp_last3_era"}
     )
     result = result.merge(
         away_sp,
@@ -890,8 +963,10 @@ def compute_inseason_sp_era(game_logs: pd.DataFrame,
 
     coverage = result["home_sp_inseason_era"].notna().mean()
     print(f"  SP in-season ERA coverage  : {coverage:.1%}")
-    return result[["Date", "home_team", "away_team",
-                   "home_sp_inseason_era", "away_sp_inseason_era"]]
+    cols = ["Date", "home_team", "away_team", "game_number",
+                   "home_sp_inseason_era", "away_sp_inseason_era",
+                   "home_sp_last3_era",    "away_sp_last3_era"]
+    return result[[c for c in cols if c in result.columns]]
 
 
 def compute_inseason_bullpen_era(game_logs: pd.DataFrame,
@@ -1002,11 +1077,11 @@ def attach_inseason_stats(games: pd.DataFrame,
 
     # --- SP ERA ---
     sp_stats = compute_inseason_sp_era(game_logs, game_sp, park_factors)
-    games = games.merge(sp_stats, on=["Date", "home_team", "away_team"], how="left")
+    games = games.merge(sp_stats, on=game_merge_keys(games, sp_stats), how="left")
 
     # --- SP workload (days rest + outs last start) ---
     sp_work = compute_sp_workload(game_logs, game_sp)
-    games = games.merge(sp_work, on=["Date", "home_team", "away_team"], how="left")
+    games = games.merge(sp_work, on=game_merge_keys(games, sp_work), how="left")
 
     # --- Bullpen ERA (quality) ---
     bp_era = compute_inseason_bullpen_era(game_logs, park_factors)
@@ -1258,6 +1333,8 @@ def attach_historical_lineups(games: pd.DataFrame,
     cols = [
         "home_lineup_ops_vs_sp", "away_lineup_ops_vs_sp",
         "lineup_ops_vs_sp_diff",
+        "home_lineup_ops_vs_lhp", "home_lineup_ops_vs_rhp",
+        "away_lineup_ops_vs_lhp", "away_lineup_ops_vs_rhp",
         "home_lineup_known_batters", "away_lineup_known_batters",
     ]
     if lineups_df is None or lineups_df.empty:
@@ -1278,21 +1355,32 @@ def attach_historical_lineups(games: pd.DataFrame,
         if col in lineup.columns:
             lineup[col] = pd.to_numeric(lineup[col], errors="coerce")
 
+    lineup["home_team"] = lineup["home_team"].apply(normalize_schedule_team)
+    lineup["away_team"] = lineup["away_team"].apply(normalize_schedule_team)
+    lineup = lineup.sort_values(["game_date", "home_team", "away_team", "game_pk"])
+    lineup["game_number"] = (
+        lineup.groupby(["game_date", "home_team", "away_team"], dropna=False)
+        .cumcount()
+        .add(1)
+        .astype(int)
+    )
+
     keep = [
-        "game_date", "home_team", "away_team",
+        "game_pk", "game_date", "home_team", "away_team", "game_number",
         "home_lineup_blend_ops_vs_lhp", "home_lineup_blend_ops_vs_rhp",
         "away_lineup_blend_ops_vs_lhp", "away_lineup_blend_ops_vs_rhp",
         "home_lineup_ops_vs_lhp", "home_lineup_ops_vs_rhp",
         "away_lineup_ops_vs_lhp", "away_lineup_ops_vs_rhp",
         "home_lineup_known_batters", "away_lineup_known_batters",
     ]
-    lineup = lineup[[c for c in keep if c in lineup.columns]].drop_duplicates(
-        ["game_date", "home_team", "away_team"], keep="last"
-    )
+    lineup = lineup[[c for c in keep if c in lineup.columns]].drop_duplicates(["game_pk"], keep="last")
 
     out = games.copy()
     out["game_date"] = pd.to_datetime(out["Date"])
-    out = out.merge(lineup, on=["game_date", "home_team", "away_team"], how="left")
+    merge_keys = ["game_date", "home_team", "away_team"]
+    if "game_number" in out.columns and "game_number" in lineup.columns:
+        merge_keys.append("game_number")
+    out = out.merge(lineup, on=merge_keys, how="left")
 
     for side in ["home", "away"]:
         for suffix in ["lhp", "rhp"]:
@@ -1312,6 +1400,13 @@ def attach_historical_lineups(games: pd.DataFrame,
         default=np.nan,
     )
     out["lineup_ops_vs_sp_diff"] = out["home_lineup_ops_vs_sp"] - out["away_lineup_ops_vs_sp"]
+    # Keep LHP/RHP split columns (blend version takes priority if available)
+    for side in ["home", "away"]:
+        for hand in ["lhp", "rhp"]:
+            blend_col = f"{side}_lineup_blend_ops_vs_{hand}"
+            split_col = f"{side}_lineup_ops_vs_{hand}"
+            if blend_col in out.columns:
+                out[split_col] = out[blend_col].combine_first(out.get(split_col, pd.Series(dtype=float)))
     out = out.drop(columns=["game_date"])
 
     cov = out["home_lineup_ops_vs_sp"].notna().mean()
@@ -1371,8 +1466,8 @@ def attach_prior_win_pct(games: pd.DataFrame) -> pd.DataFrame:
 #   h2h_run_diff       — avg run diff from H's perspective in those N games
 #
 # shift(1) ensures the current game is always excluded (no leakage).
-# min_periods=1 so early-season games still get a value once one prior
-# meeting exists; NaN only for the very first time two teams ever meet.
+# min_periods=3 avoids letting one or two prior games create extreme matchup
+# signals; NaN is imputed downstream until there is enough matchup history.
 # ---------------------------------------------------------------------------
 
 def compute_h2h_stats(games: pd.DataFrame, n_games: int = 10) -> pd.DataFrame:
@@ -1382,14 +1477,14 @@ def compute_h2h_stats(games: pd.DataFrame, n_games: int = 10) -> pd.DataFrame:
     games = games.sort_values("Date").reset_index(drop=True)
 
     # Build a symmetric view: one row per (focal_team, opponent, game)
-    home_view = games[["Date", "home_team", "away_team", "home_win",
+    home_view = games[["game_id", "Date", "home_team", "away_team", "home_win",
                         "home_runs", "away_runs"]].copy()
     home_view["focal"]     = home_view["home_team"]
     home_view["opponent"]  = home_view["away_team"]
     home_view["focal_win"] = home_view["home_win"]
     home_view["focal_rd"]  = home_view["home_runs"] - home_view["away_runs"]
 
-    away_view = games[["Date", "home_team", "away_team", "home_win",
+    away_view = games[["game_id", "Date", "home_team", "away_team", "home_win",
                         "home_runs", "away_runs"]].copy()
     away_view["focal"]     = away_view["away_team"]
     away_view["opponent"]  = away_view["home_team"]
@@ -1398,8 +1493,8 @@ def compute_h2h_stats(games: pd.DataFrame, n_games: int = 10) -> pd.DataFrame:
 
     hist = (
         pd.concat(
-            [home_view[["Date", "focal", "opponent", "focal_win", "focal_rd"]],
-             away_view[["Date", "focal", "opponent", "focal_win", "focal_rd"]]],
+            [home_view[["game_id", "Date", "focal", "opponent", "focal_win", "focal_rd"]],
+             away_view[["game_id", "Date", "focal", "opponent", "focal_win", "focal_rd"]]],
             ignore_index=True,
         )
         .sort_values(["focal", "opponent", "Date"])
@@ -1409,10 +1504,10 @@ def compute_h2h_stats(games: pd.DataFrame, n_games: int = 10) -> pd.DataFrame:
     # Rolling over prior n_games meetings (shift-1 excludes current game)
     grp = hist.groupby(["focal", "opponent"])
     hist["h2h_win_rate"] = grp["focal_win"].transform(
-        lambda s: s.shift(1).rolling(n_games, min_periods=1).mean()
+        lambda s: s.shift(1).rolling(n_games, min_periods=3).mean()
     )
     hist["h2h_run_diff"] = grp["focal_rd"].transform(
-        lambda s: s.shift(1).rolling(n_games, min_periods=1).mean()
+        lambda s: s.shift(1).rolling(n_games, min_periods=3).mean()
     )
 
     # Pull out only the home-team perspective to merge back
@@ -1420,14 +1515,14 @@ def compute_h2h_stats(games: pd.DataFrame, n_games: int = 10) -> pd.DataFrame:
         hist.rename(columns={"focal": "home_team", "opponent": "away_team",
                               "h2h_win_rate": "h2h_home_win_rate",
                               "h2h_run_diff": "h2h_home_run_diff"})
-        [["Date", "home_team", "away_team", "h2h_home_win_rate", "h2h_home_run_diff"]]
-        .drop_duplicates(["Date", "home_team", "away_team"])
+        [["Date", "home_team", "away_team", "game_id", "h2h_home_win_rate", "h2h_home_run_diff"]]
+        .drop_duplicates(["game_id"])
     )
 
-    games = games.merge(home_h2h, on=["Date", "home_team", "away_team"], how="left")
+    games = games.merge(home_h2h, on=["Date", "home_team", "away_team", "game_id"], how="left")
 
     cov = games["h2h_home_win_rate"].notna().mean()
-    print(f"  H2H coverage: {cov:.1%}  (NaN only for first-ever meetings)")
+    print(f"  H2H coverage: {cov:.1%}  (requires 3 prior meetings)")
     return games
 
 
@@ -1515,7 +1610,13 @@ def attach_umpire_factor(games: pd.DataFrame,
     # Summing all pitchers in a game gives total runs by both teams.
     pl = pitcher_logs.copy()
     pl["game_date"] = pd.to_datetime(pl["game_date"])
-    game_runs = (pl.groupby(["game_date", "home_team"])["runs_allowed"]
+    for col in ["home_team", "away_team"]:
+        if col in pl.columns:
+            pl[col] = pl[col].apply(normalize_schedule_team)
+    run_keys = ["game_date", "home_team", "away_team"]
+    if "game_id" in pl.columns:
+        run_keys.append("game_id")
+    game_runs = (pl.groupby(run_keys)["runs_allowed"]
                    .sum()
                    .reset_index()
                    .rename(columns={"runs_allowed": "total_runs"}))
@@ -1523,7 +1624,13 @@ def attach_umpire_factor(games: pd.DataFrame,
     # ── 2. Attach total runs to ump log ────────────────────────────────────
     ul = ump_logs.copy()
     ul["game_date"] = pd.to_datetime(ul["game_date"])
-    ul = ul.merge(game_runs, on=["game_date", "home_team"], how="inner")
+    for col in ["home_team", "away_team"]:
+        if col in ul.columns:
+            ul[col] = ul[col].apply(normalize_schedule_team)
+    merge_keys = ["game_date", "home_team", "away_team"]
+    if "game_id" in ul.columns and "game_id" in game_runs.columns:
+        merge_keys.append("game_id")
+    ul = ul.merge(game_runs, on=merge_keys, how="inner")
     ul["year"] = ul["game_date"].dt.year
 
     # ── 3. League-average runs/game by year ─────────────────────────────────
@@ -1542,20 +1649,27 @@ def attach_umpire_factor(games: pd.DataFrame,
     )
 
     # ── 6. Dictionary lookup — avoids merge-induced row duplication ─────────
-    # Key: (date_str, home_team) → ump_run_factor
+    # Key: (date_str, home_team, away_team, game_number) → ump_run_factor
     # Use string dates to sidestep any datetime dtype mismatches.
     ul["_date_str"] = ul["game_date"].dt.strftime("%Y-%m-%d")
-    # For doubleheaders: multiple umps on same date/park — keep the first (arbitrary but consistent)
-    ul_dedup = ul.drop_duplicates(subset=["_date_str", "home_team"], keep="first")
+    ul = ul.sort_values(["game_date", "home_team", "away_team", "game_id"]).reset_index(drop=True)
+    ul["game_number"] = (
+        ul.groupby(["game_date", "home_team", "away_team"], dropna=False).cumcount() + 1
+    )
+    ul_dedup = ul.drop_duplicates(
+        subset=["_date_str", "home_team", "away_team", "game_number"], keep="first"
+    )
     factor_dict: dict[tuple, float] = {
-        (row["_date_str"], row["home_team"]): row["ump_run_factor"]
+        (row["_date_str"], row["home_team"], row["away_team"], row["game_number"]): row["ump_run_factor"]
         for _, row in ul_dedup.iterrows()
         if pd.notna(row["ump_run_factor"])
     }
 
     games["ump_run_factor"] = [
-        factor_dict.get((pd.Timestamp(d).strftime("%Y-%m-%d"), ht), 1.0)
-        for d, ht in zip(games["Date"], games["home_team"])
+        factor_dict.get((pd.Timestamp(d).strftime("%Y-%m-%d"), ht, at, gn), 1.0)
+        for d, ht, at, gn in zip(
+            games["Date"], games["home_team"], games["away_team"], games["game_number"]
+        )
     ]
 
     cov = (games["ump_run_factor"] != 1.0).mean()
@@ -1650,6 +1764,10 @@ FEATURE_COLS = [
     "home_sp_inseason_era",
     "away_sp_inseason_era",
     "sp_inseason_era_diff",
+    # In-season rolling SP ERA (last 3 starts) — recent form signal
+    "home_sp_last3_era",
+    "away_sp_last3_era",
+    "sp_last3_era_diff",
     # In-season rolling bullpen RA/9 (last 15 days) — higher signal
     "home_bullpen_inseason_era",
     "away_bullpen_inseason_era",
@@ -1683,6 +1801,13 @@ FEATURE_COLS = [
     "home_lineup_ops_vs_sp",
     "away_lineup_ops_vs_sp",
     "lineup_ops_vs_sp_diff",
+    # Lineup OPS vs LHP/RHP separately (handedness split signal)
+    "home_lineup_ops_vs_lhp",
+    "home_lineup_ops_vs_rhp",
+    "away_lineup_ops_vs_lhp",
+    "away_lineup_ops_vs_rhp",
+    "lineup_ops_vs_lhp_diff",
+    "lineup_ops_vs_rhp_diff",
     "home_lineup_known_batters",
     "away_lineup_known_batters",
     "lineup_known_batters_diff",
@@ -1756,6 +1881,20 @@ FEATURE_COLS = [
     "home_hard_hit_pct",
     "away_hard_hit_pct",
     "hard_hit_pct_diff",
+    # Home/away venue split run differential (team quality at home vs on road)
+    "home_home_rd",
+    "home_away_rd",
+    "away_home_rd",
+    "away_away_rd",
+    "home_rd_split",
+    "away_rd_split",
+    "rd_venue_diff",
+    # Rule-change era indicator (shift ban + pitch clock: 2023+)
+    "post_2023_rules",
+    # Calendar timing: lets the model learn early-season home/team-quality effects
+    "game_month",
+    "game_day_of_year",
+    "is_early_season",
     # Market-aware feature. This is kept in features.csv, but training builds
     # separate market-independent and market-aware model artifacts.
     "vegas_home_prob",
@@ -1765,6 +1904,13 @@ TARGET_COL = "home_win"
 
 
 def build_feature_matrix(games: pd.DataFrame) -> pd.DataFrame:
+    game_dates = pd.to_datetime(games["Date"])
+    # Rule-change era flag: shift ban + pitch clock took effect 2023
+    games["post_2023_rules"] = (game_dates.dt.year >= 2023).astype(float)
+    games["game_month"] = game_dates.dt.month.astype(float)
+    games["game_day_of_year"] = game_dates.dt.dayofyear.astype(float)
+    games["is_early_season"] = game_dates.dt.month.isin([3, 4]).astype(float)
+
     games["rd_diff"]                   = games["home_rolling_rd"]           - games["away_rolling_rd"]
     games["rs_diff"]                   = games["home_rolling_rs"]           - games["away_rolling_rs"]
     games["last7_rd_diff"]             = games["home_last7_rd"]             - games["away_last7_rd"]
@@ -1818,6 +1964,32 @@ def build_feature_matrix(games: pd.DataFrame) -> pd.DataFrame:
                     "home_sp_outs_last", "away_sp_outs_last", "sp_outs_last_diff"]:
             games[col] = np.nan
 
+    # Last-3-starts SP ERA diffs (#2)
+    if "home_sp_last3_era" in games.columns:
+        games["sp_last3_era_diff"] = games["away_sp_last3_era"] - games["home_sp_last3_era"]
+    else:
+        for col in ["home_sp_last3_era", "away_sp_last3_era", "sp_last3_era_diff"]:
+            games[col] = np.nan
+
+    # Lineup LHP/RHP split diffs (#3)
+    for side in ["home", "away"]:
+        for hand in ["lhp", "rhp"]:
+            col = f"{side}_lineup_ops_vs_{hand}"
+            if col not in games.columns:
+                games[col] = np.nan
+    games["lineup_ops_vs_lhp_diff"] = games["home_lineup_ops_vs_lhp"] - games["away_lineup_ops_vs_lhp"]
+    games["lineup_ops_vs_rhp_diff"] = games["home_lineup_ops_vs_rhp"] - games["away_lineup_ops_vs_rhp"]
+
+    # Home/away venue split run differential (#4)
+    if "home_home_rd" in games.columns:
+        games["home_rd_split"]  = games["home_home_rd"] - games["home_away_rd"]
+        games["away_rd_split"]  = games["away_home_rd"] - games["away_away_rd"]
+        games["rd_venue_diff"]  = games["home_home_rd"] - games["away_away_rd"]
+    else:
+        for col in ["home_home_rd", "home_away_rd", "away_home_rd", "away_away_rd",
+                    "home_rd_split", "away_rd_split", "rd_venue_diff"]:
+            games[col] = np.nan
+
     for col in ["vegas_home_prob", "home_lineup_ops", "away_lineup_ops"]:
         if col not in games.columns:
             games[col] = np.nan
@@ -1844,7 +2016,14 @@ def build_feature_matrix(games: pd.DataFrame) -> pd.DataFrame:
         print(f"  WARNING: {len(missing)}/{len(FEATURE_COLS)} feature cols absent "
               f"({coverage_pct:.0f}% coverage): {missing[:10]}{'…' if len(missing) > 10 else ''}")
 
-    id_cols = ["Date", "year", "home_team", "away_team", "home_runs", "away_runs", TARGET_COL]
+    for col in ["game_id", "game_number", "game_pk"]:
+        if col not in games.columns:
+            games[col] = np.nan
+    id_cols = [
+        "game_id", "game_number", "game_pk",
+        "Date", "year", "home_team", "away_team",
+        "home_runs", "away_runs", TARGET_COL,
+    ]
     out = games[id_cols + available].copy()
     # Drop rows where either rolling_rd is NaN — these are early-season games
     # with < min_periods prior games and would bias training with noisy inputs.
@@ -1888,6 +2067,30 @@ if __name__ == "__main__":
     weather       = pd.read_csv(weather_path, parse_dates=["date"])
     game_sp       = pd.read_csv(sp_path, parse_dates=["Date"])
     game_logs     = pd.read_csv(gl_path,  parse_dates=["game_date"])
+    for frame in [game_sp, game_logs]:
+        for col in ["home_team", "away_team"]:
+            if col in frame.columns:
+                frame[col] = frame[col].apply(normalize_schedule_team)
+
+    # Merge in live (current-season) pitcher data if available
+    live_logs_path = os.path.join(DATA_DIR, "pitcher_game_logs_live.csv")
+    live_sp_path   = os.path.join(DATA_DIR, "game_sp_live.csv")
+    if os.path.exists(live_logs_path):
+        live_logs = pd.read_csv(live_logs_path, parse_dates=["game_date"])
+        for col in ["home_team", "away_team"]:
+            live_logs[col] = live_logs[col].apply(normalize_schedule_team)
+        game_logs = pd.concat([game_logs, live_logs], ignore_index=True).drop_duplicates(
+            subset=["game_id", "pitcher_id"]
+        )
+        print(f"  Merged live pitcher logs: {len(live_logs):,} rows → total {len(game_logs):,}")
+    if os.path.exists(live_sp_path):
+        live_sp = pd.read_csv(live_sp_path, parse_dates=["Date"])
+        for col in ["home_team", "away_team"]:
+            live_sp[col] = live_sp[col].apply(normalize_schedule_team)
+        game_sp = pd.concat([game_sp, live_sp], ignore_index=True).drop_duplicates(
+            subset=["Date", "home_team", "away_team", "home_sp_name", "away_sp_name"]
+        )
+        print(f"  Merged live SP assignments: {len(live_sp):,} rows → total {len(game_sp):,}")
     ump_logs      = pd.read_csv(ump_path, parse_dates=["game_date"]) if os.path.exists(ump_path) else None
     il_path       = os.path.join(DATA_DIR, "il_counts.csv")
     il_df         = pd.read_csv(il_path,  parse_dates=["date"]) if os.path.exists(il_path) else None
@@ -1900,12 +2103,30 @@ if __name__ == "__main__":
     live_path = os.path.join(DATA_DIR, "game_logs_live.csv")
     if os.path.exists(live_path):
         live = pd.read_csv(live_path, parse_dates=["Date"])
-        existing_keys = set(zip(games["Date"].astype(str), games["home_team"]))
+        for col in ["home_team", "away_team"]:
+            live[col] = live[col].apply(normalize_schedule_team)
+        existing_keys = set(zip(
+            games["Date"].dt.strftime("%Y-%m-%d"),
+            games["home_team"],
+            games["away_team"],
+            games["home_runs"],
+            games["away_runs"],
+        ))
         new_rows = live[
-            ~live.apply(lambda r: (str(r["Date"])[:10], r["home_team"]) in existing_keys, axis=1)
+            ~live.apply(
+                lambda r: (
+                    str(r["Date"])[:10],
+                    r["home_team"],
+                    r["away_team"],
+                    r["home_runs"],
+                    r["away_runs"],
+                ) in existing_keys,
+                axis=1,
+            )
         ]
         if not new_rows.empty:
             games = pd.concat([games, new_rows], ignore_index=True).sort_values("Date")
+            games = add_game_identity(games)
             print(f"  +{len(new_rows)} games from game_logs_live.csv  → {len(games):,} total")
         else:
             print(f"  game_logs_live.csv: no new games beyond pybaseball cache")
@@ -2042,28 +2263,37 @@ if __name__ == "__main__":
         if os.path.exists(p):
             df = pd.read_csv(p, dtype={"game_date": str})
             df = df.rename(columns={"game_date": "Date", "consensus_prob": "vegas_home_prob"})
-            odds_frames.append(df[["Date", "home_team", "away_team", "vegas_home_prob"]])
+            for col in ["home_team", "away_team"]:
+                df[col] = df[col].apply(normalize_schedule_team)
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = add_game_identity(df)
+            odds_frames.append(df[["Date", "home_team", "away_team", "game_number", "vegas_home_prob"]])
 
     # historical_odds.csv (2015-2021): has 'date' + raw home_ml/away_ml, no consensus_prob
     hist_path = os.path.join(DATA_DIR, "historical_odds.csv")
     if os.path.exists(hist_path):
         hist = pd.read_csv(hist_path)
         hist = hist.rename(columns={"date": "Date"})
+        for col in ["home_team", "away_team"]:
+            hist[col] = hist[col].apply(normalize_schedule_team)
         hist["vegas_home_prob"] = hist.apply(
             lambda r: _devig(r["home_ml"], r["away_ml"])
             if pd.notna(r.get("home_ml")) and pd.notna(r.get("away_ml")) else np.nan,
             axis=1,
         )
-        odds_frames.append(hist[["Date", "home_team", "away_team", "vegas_home_prob"]])
+        hist["Date"] = pd.to_datetime(hist["Date"])
+        hist = add_game_identity(hist)
+        odds_frames.append(hist[["Date", "home_team", "away_team", "game_number", "vegas_home_prob"]])
 
     if odds_frames:
         odds_df = (pd.concat(odds_frames, ignore_index=True)
                      .dropna(subset=["vegas_home_prob"]))
         odds_df["Date"] = pd.to_datetime(odds_df["Date"])
-        odds_df = odds_df.drop_duplicates(["Date", "home_team", "away_team"])
+        odds_df = odds_df.drop_duplicates(["Date", "home_team", "away_team", "game_number"])
+        merge_keys = game_merge_keys(games, odds_df)
         games = games.merge(
-            odds_df[["Date", "home_team", "away_team", "vegas_home_prob"]],
-            on=["Date", "home_team", "away_team"], how="left"
+            odds_df[merge_keys + ["vegas_home_prob"]],
+            on=merge_keys, how="left"
         )
         coverage = games["vegas_home_prob"].notna().mean()
         n_games  = games["vegas_home_prob"].notna().sum()

@@ -127,7 +127,7 @@ PARK_COORDS: dict[str, tuple[float, float]] = {
     "LAA": (33.8003, -117.8827), "LAD": (34.0739, -118.2400),
     "MIA": (25.7781,  -80.2197), "MIL": (43.0280,  -87.9712),
     "MIN": (44.9817,  -93.2781), "NYM": (40.7571,  -73.8458),
-    "NYY": (40.8296,  -73.9262), "OAK": (37.7516, -122.2005),
+    "NYY": (40.8296,  -73.9262), "ATH": (37.7516, -122.2005),
     "PHI": (39.9061,  -75.1665), "PIT": (40.4469,  -80.0057),
     "SDP": (32.7076, -117.1570), "SEA": (47.5914, -122.3325),
     "SFG": (37.7786, -122.3893), "STL": (38.6226,  -90.1928),
@@ -179,9 +179,19 @@ def compute_rest_travel(team: str,
 
 TEAM_ABBREV_HELP = (
     "ARI ATL BAL BOS CHC CHW CIN CLE COL DET "
-    "HOU KCR LAA LAD MIA MIL MIN NYM NYY OAK "
+    "HOU KCR LAA LAD MIA MIL MIN NYM NYY ATH "
     "PHI PIT SDP SEA SFG STL TBR TEX TOR WSN"
 )
+
+TEAM_ALIASES = {
+    "OAK": "ATH",
+    "ATH": "ATH",
+}
+
+
+def canonical_team(team: str) -> str:
+    abbr = str(team or "").strip().upper()
+    return TEAM_ALIASES.get(abbr, abbr)
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +233,7 @@ def get_team_ops(team: str, year: int, batting_stats_df: pd.DataFrame) -> float:
             "los angeles dodgers": "LAD", "miami marlins": "MIA",
             "milwaukee brewers": "MIL", "minnesota twins": "MIN",
             "new york mets": "NYM", "new york yankees": "NYY",
-            "oakland athletics": "OAK", "philadelphia phillies": "PHI",
+            "oakland athletics": "ATH", "philadelphia phillies": "PHI",
             "pittsburgh pirates": "PIT", "san diego padres": "SDP",
             "seattle mariners": "SEA", "san francisco giants": "SFG",
             "st. louis cardinals": "STL", "tampa bay rays": "TBR",
@@ -233,7 +243,7 @@ def get_team_ops(team: str, year: int, batting_stats_df: pd.DataFrame) -> float:
             "boston": "BOS", "cincinnati": "CIN", "cleveland": "CLE",
             "colorado": "COL", "detroit": "DET", "houston": "HOU",
             "kansas city": "KCR", "miami": "MIA", "milwaukee": "MIL",
-            "minnesota": "MIN", "oakland": "OAK", "philadelphia": "PHI",
+            "minnesota": "MIN", "oakland": "ATH", "philadelphia": "PHI",
             "pittsburgh": "PIT", "san diego": "SDP", "seattle": "SEA",
             "san francisco": "SFG", "st. louis": "STL", "tampa bay": "TBR",
             "texas": "TEX", "toronto": "TOR", "washington": "WSN",
@@ -309,7 +319,8 @@ def compute_h2h_live(home_team: str,
                      away_team: str,
                      game_date: pd.Timestamp,
                      features_df: pd.DataFrame,
-                     n_games: int = 10) -> dict:
+                     n_games: int = 10,
+                     min_games: int = 3) -> dict:
     """
     Compute rolling head-to-head stats for home_team vs away_team
     using only current-season prior meetings recorded in features_df.
@@ -327,7 +338,7 @@ def compute_h2h_live(home_team: str,
     )
     prior = features_df[mask].sort_values("Date").tail(n_games)
 
-    if prior.empty:
+    if len(prior) < min_games:
         return {"h2h_home_win_rate": np.nan, "h2h_home_run_diff": np.nan}
 
     wins, rds = [], []
@@ -523,6 +534,9 @@ def _get_recent_sp_name(team: str, game_date: pd.Timestamp,
 def build_input_row(home: dict, away: dict) -> pd.DataFrame:
     park_dims = PARK_DIMENSIONS.get(home.get("team", ""), {})
     return pd.DataFrame([{
+        "game_month":                home.get("game_month", np.nan),
+        "game_day_of_year":          home.get("game_day_of_year", np.nan),
+        "is_early_season":           home.get("is_early_season", np.nan),
         "home_rolling_rd":           home["rolling_rd"],
         "away_rolling_rd":           away["rolling_rd"],
         "rd_diff":                   home["rolling_rd"]           - away["rolling_rd"],
@@ -671,16 +685,23 @@ def predict_matchup(home_team: str,
                     ump_name: str | None = None,
                     home_sp_name: str | None = None,
                     away_sp_name: str | None = None,
-                    verbose: bool = True) -> float:
-    model_path = os.path.join(MODEL_DIR, "win_prob_model.pkl")
-    if not os.path.exists(model_path):
+                    verbose: bool = True,
+                    model_mode: str = "independent") -> float:
+    home_team = canonical_team(home_team)
+    away_team = canonical_team(away_team)
+
+    independent_model_path = os.path.join(MODEL_DIR, "win_prob_model.pkl")
+    market_model_path = os.path.join(MODEL_DIR, "win_prob_market_model.pkl")
+    if not os.path.exists(independent_model_path):
         raise FileNotFoundError(
-            f"Model not found at {model_path}. Run train_model.py first."
+            f"Model not found at {independent_model_path}. Run train_model.py first."
         )
 
-    artifact  = _load_model(model_path)
-    pipeline  = artifact["pipeline"]
-    feat_cols = artifact["features"]
+    valid_model_modes = {"auto", "independent", "market"}
+    if model_mode not in valid_model_modes:
+        raise ValueError(
+            f"model_mode must be one of {sorted(valid_model_modes)}, got {model_mode!r}"
+        )
 
     features_df = _load_csv(os.path.join(DATA_DIR, "features.csv"), parse_dates=["Date"])
     live_logs   = _load_csv(os.path.join(DATA_DIR, "game_logs_live.csv"), parse_dates=["Date"])
@@ -690,6 +711,9 @@ def predict_matchup(home_team: str,
 
     home_feats = get_latest_team_features(home_team, year, features_df, live_logs)
     away_feats = get_latest_team_features(away_team, year, features_df, live_logs)
+    home_feats["game_month"] = float(gdate.month)
+    home_feats["game_day_of_year"] = float(gdate.dayofyear)
+    home_feats["is_early_season"] = 1.0 if gdate.month in (3, 4) else 0.0
     home_feats["team"] = home_team
     away_feats["team"] = away_team
 
@@ -748,12 +772,23 @@ def predict_matchup(home_team: str,
     away_feats["barrel_pct"]   = away_sc.get("barrel_pct",   np.nan)
     away_feats["hard_hit_pct"] = away_sc.get("hard_hit_pct", np.nan)
 
-    # Compute bullpen usage (outs in last 3 days) from Retrosheet event logs
-    gl_path  = os.path.join(DATA_DIR, "pitcher_game_logs.csv")
-    ump_path = os.path.join(DATA_DIR, "umpire_game_logs.csv")
+    # Compute bullpen usage (outs in last 3 days) from Retrosheet + live logs
+    gl_path      = os.path.join(DATA_DIR, "pitcher_game_logs.csv")
+    gl_live_path = os.path.join(DATA_DIR, "pitcher_game_logs_live.csv")
+    ump_path     = os.path.join(DATA_DIR, "umpire_game_logs.csv")
     try:
         game_logs_df = _load_csv(gl_path, parse_dates=["game_date"])
-        if game_logs_df is not None:
+        # Merge 2026 live pitcher logs so bullpen usage + SP workload use current data
+        live_gl = (_load_csv(gl_live_path, parse_dates=["game_date"])
+                   if os.path.exists(gl_live_path) else None)
+        if live_gl is not None and not live_gl.empty:
+            if game_logs_df is not None and not game_logs_df.empty:
+                game_logs_df = pd.concat(
+                    [game_logs_df, live_gl], ignore_index=True
+                ).drop_duplicates(subset=["game_id", "pitcher_id"])
+            else:
+                game_logs_df = live_gl
+        if game_logs_df is not None and not game_logs_df.empty:
             home_bu = compute_bullpen_usage_live(home_team, gdate, game_logs_df)
             away_bu = compute_bullpen_usage_live(away_team, gdate, game_logs_df)
         else:
@@ -809,8 +844,11 @@ def predict_matchup(home_team: str,
     home_sp_throws = away_sp_throws = None
     try:
         pitcher_stuff_df = _load_csv(os.path.join(DATA_DIR, "pitcher_stuff.csv"))
-        # Match training: season-level SP stuff uses prior-season values.
-        stuff_year = year - 1
+        # For live/future predictions, use current-season SP stuff when the
+        # pitcher has enough PA; get_pitcher_stuff blends small samples with
+        # prior-year data. Historical training still uses prior-season values
+        # to avoid leakage.
+        stuff_year = year
         # Prefer explicitly supplied SP names; fall back to last known from features
         if home_sp_name:
             home_sp_norm = _normalize_name(home_sp_name)
@@ -912,7 +950,24 @@ def predict_matchup(home_team: str,
         lineups_df = None
         h_lops = a_lops = np.nan
 
-    X = build_input_row(home_feats, away_feats)[feat_cols]
+    use_market_model = (
+        model_mode == "market"
+    )
+    model_path = market_model_path if use_market_model else independent_model_path
+    if use_market_model and not os.path.exists(market_model_path):
+        raise FileNotFoundError(
+            f"Market-aware model not found at {market_model_path}. Run train_model.py first."
+        )
+
+    artifact = _load_model(model_path)
+    pipeline = artifact["pipeline"]
+    feat_cols = artifact["features"]
+
+    X = build_input_row(home_feats, away_feats)
+    for col in feat_cols:
+        if col not in X.columns:
+            X[col] = np.nan
+    X = X[feat_cols]
     prob_home_win = pipeline.predict_proba(X)[0, 1]
 
     if verbose:
@@ -922,6 +977,8 @@ def predict_matchup(home_team: str,
         print(f"  Home ({home_team}) win probability:  {prob_home_win:.1%}")
         print(f"  Away ({away_team}) win probability:  {1 - prob_home_win:.1%}")
         print(f"{'='*45}")
+        model_label = artifact.get("model_type", "market_aware" if use_market_model else "market_independent")
+        print(f"  Probability model        : {model_label}")
         print(f"\n  Feature snapshot (last {home_team} data):")
         print(f"    Home rolling run-diff  : {home_feats['rolling_rd']:+.2f}")
         print(f"    Away rolling run-diff  : {away_feats['rolling_rd']:+.2f}")
@@ -949,7 +1006,7 @@ def predict_matchup(home_team: str,
         h2h_wr = home_feats.get("h2h_home_win_rate")
         if h2h_wr == h2h_wr:   # not NaN
             h2h_rd = home_feats.get("h2h_home_run_diff", np.nan)
-            print(f"    H2H home win rate      : {h2h_wr:.1%}  (last 10 meetings)")
+            print(f"    H2H home win rate      : {h2h_wr:.1%}  (last 10 meetings, min 3)")
             print(f"    H2H run diff (home)    : {h2h_rd:+.2f} runs/game")
         hbu = home_feats.get("bullpen_outs_3d")
         abu = away_feats.get("bullpen_outs_3d")
@@ -972,7 +1029,7 @@ def predict_matchup(home_team: str,
             print(f"    Home team OPS (prior yr): {hop:.3f}")
             print(f"    Away team OPS (prior yr): {aop:.3f}")
         tf = home_feats.get("temp_f")
-        if tf == tf:
+        if tf is not None and tf == tf:
             ws  = home_feats.get("wind_speed_mph", 0)
             wtc = home_feats.get("wind_to_cf", 0)
             hum = home_feats.get("humidity_pct", np.nan)
@@ -1076,6 +1133,12 @@ if __name__ == "__main__":
     single.add_argument("--year", type=int, default=2026)
     single.add_argument("--date", default=None, help="Game date YYYY-MM-DD (default: today)")
     single.add_argument("--ump",  default=None, help="Home plate umpire name (optional)")
+    single.add_argument(
+        "--model-mode",
+        choices=["auto", "independent", "market"],
+        default="independent",
+        help="Probability model to use. auto is an alias for independent.",
+    )
 
     # Batch
     batch = sub.add_parser("batch", help="Predict from a CSV file")
@@ -1087,7 +1150,8 @@ if __name__ == "__main__":
 
     if args.command == "game":
         predict_matchup(args.home.upper(), args.away.upper(), args.year,
-                        game_date=args.date, ump_name=args.ump)
+                        game_date=args.date, ump_name=args.ump,
+                        model_mode=args.model_mode)
     elif args.command == "batch":
         predict_batch(args.input, args.output, args.year)
     else:

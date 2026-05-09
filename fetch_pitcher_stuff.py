@@ -23,13 +23,20 @@ import re
 import warnings
 import numpy as np
 import pandas as pd
-import pybaseball as pb
-
-warnings.filterwarnings("ignore")
-pb.cache.enable()
 
 DATA_DIR   = os.path.join(os.path.dirname(__file__), "data")
 CACHE_PATH = os.path.join(DATA_DIR, "pitcher_stuff.csv")
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.environ.setdefault("PYBASEBALL_CACHE", os.path.join(LOG_DIR, "pybaseball_cache"))
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(LOG_DIR, "matplotlib_cache"))
+os.makedirs(os.environ["PYBASEBALL_CACHE"], exist_ok=True)
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+
+import pybaseball as pb
+
+warnings.filterwarnings("ignore")
+
+pb.cache.enable()
 
 # MLB Stats API team name → our abbreviation (for BRef team names)
 BREF_TEAM_MAP = {
@@ -43,7 +50,7 @@ BREF_TEAM_MAP = {
     "Los Angeles Dodgers": "LAD", "Miami Marlins": "MIA",
     "Milwaukee Brewers": "MIL", "Minnesota Twins": "MIN",
     "New York Mets": "NYM", "New York Yankees": "NYY",
-    "Oakland Athletics": "OAK", "Philadelphia Phillies": "PHI",
+    "Oakland Athletics": "ATH", "Philadelphia Phillies": "PHI",
     "Pittsburgh Pirates": "PIT", "San Diego Padres": "SDP",
     "Seattle Mariners": "SEA", "San Francisco Giants": "SFG",
     "St. Louis Cardinals": "STL", "Tampa Bay Rays": "TBR",
@@ -54,7 +61,7 @@ BREF_TEAM_MAP = {
     "CHC": "CHC", "CHW": "CHW", "CIN": "CIN", "CLE": "CLE",
     "COL": "COL", "DET": "DET", "HOU": "HOU", "KCR": "KCR",
     "LAA": "LAA", "LAD": "LAD", "MIA": "MIA", "MIL": "MIL",
-    "MIN": "MIN", "NYM": "NYM", "NYY": "NYY", "OAK": "OAK",
+    "MIN": "MIN", "NYM": "NYM", "NYY": "NYY", "OAK": "ATH",
     "PHI": "PHI", "PIT": "PIT", "SDP": "SDP", "SEA": "SEA",
     "SFG": "SFG", "STL": "STL", "TBR": "TBR", "TEX": "TEX",
     "TOR": "TOR", "WSN": "WSN",
@@ -123,7 +130,7 @@ def _fetch_year(year: int) -> pd.DataFrame:
 
     # 3. xERA (xFIP proxy) and PA from expected stats
     try:
-        exp = pb.statcast_pitcher_expected_stats(year)
+        exp = pb.statcast_pitcher_expected_stats(year, minPA=0)
         for _, r in exp.iterrows():
             pid = int(r["player_id"])
             rows.setdefault(pid, {})
@@ -247,16 +254,21 @@ def get_pitcher_stuff(name_norm: str,
                        team: str,
                        year: int,
                        stuff_df: pd.DataFrame,
-                       min_pa: int = 150) -> dict:
+                       min_pa: int = 150,
+                       current_pa_override: float | None = None) -> dict:
     """
     Return pitch stuff for a pitcher.
 
     When current-year PA < min_pa (early season small sample), blend with the
-    most recent prior-year row weighted by PA so a 2-start xFIP doesn't dominate.
+    most recent prior-year row on a smooth ramp: 0 PA = 0% current year,
+    min_pa PA = 100% current year.
+    current_pa_override lets historical feature builds use an as-of-game PA
+    estimate instead of the full-season PA in pitcher_stuff.csv.
     Falls back to team median if the pitcher isn't found at all.
     """
     empty = {"FBv": np.nan, "SwStr_pct": np.nan, "K_pct": np.nan,
-             "BB_pct": np.nan, "xFIP": np.nan, "Throws": None, "pa": np.nan}
+             "BB_pct": np.nan, "xFIP": np.nan, "Throws": None,
+             "GS": np.nan, "pa": np.nan}
 
     if stuff_df is None or stuff_df.empty:
         return empty
@@ -274,11 +286,16 @@ def get_pitcher_stuff(name_norm: str,
 
         if not cur.empty:
             r_cur = cur.iloc[0]
-            cur_pa = int(r_cur.get("pa", 0) or 0)
+            raw_cur_pa = int(r_cur.get("pa", 0) or 0)
+            cur_pa = raw_cur_pa
+            if current_pa_override is not None and pd.notna(current_pa_override):
+                cur_pa = max(0, int(current_pa_override))
 
             if cur_pa >= min_pa:
                 # Enough sample — use current year as-is
-                return {k: r_cur.get(k, np.nan) for k in empty}
+                result = {k: r_cur.get(k, np.nan) for k in empty}
+                result["pa"] = cur_pa
+                return result
 
             if prior.empty:
                 # Small sample, no prior seasons — blend with league median to avoid noise.
@@ -287,32 +304,36 @@ def get_pitcher_stuff(name_norm: str,
                                        & (stuff_df["name_norm"] != name_norm)]
                 if anchor_rows.empty:
                     anchor_rows = stuff_df[stuff_df["year"] == year]
-                med_pa = 300  # weight for the median anchor (≈ half a season)
-                total = cur_pa + med_pa
+                cur_weight = max(0.0, min(1.0, cur_pa / float(min_pa)))
+                anchor_weight = 1.0 - cur_weight
                 result = {}
                 for col in ["FBv", "SwStr_pct", "K_pct", "xFIP"]:
                     c_val = r_cur.get(col, np.nan)
                     m_val = float(anchor_rows[col].median()) if col in anchor_rows and anchor_rows[col].notna().any() else np.nan
                     if pd.notna(c_val) and pd.notna(m_val):
-                        result[col] = (c_val * cur_pa + m_val * med_pa) / total
+                        result[col] = (c_val * cur_weight) + (m_val * anchor_weight)
                     elif pd.notna(c_val):
                         result[col] = float(c_val)
                     else:
                         result[col] = m_val if pd.notna(m_val) else np.nan
                 result["BB_pct"] = np.nan
                 result["Throws"] = r_cur.get("Throws")
+                result["GS"] = r_cur.get("GS", np.nan)
+                result["pa"] = cur_pa
                 return result
 
-            # Small sample — blend current year with most recent prior year
+            # Small sample — blend current year with most recent prior year.
+            # Use a smooth ramp instead of raw PA weighting so a pitcher near
+            # the threshold is mostly current-season, not mostly prior-year.
             r_pri = prior.iloc[-1]
-            pri_pa = min(int(r_pri.get("pa", 0) or 0), 600)  # cap prior weight at ~1 season
-            total = cur_pa + pri_pa
+            cur_weight = max(0.0, min(1.0, cur_pa / float(min_pa)))
+            prior_weight = 1.0 - cur_weight
             result = {}
             for col in ["FBv", "SwStr_pct", "K_pct", "xFIP"]:
                 c_val = r_cur.get(col, np.nan)
                 p_val = r_pri.get(col, np.nan)
                 if pd.notna(c_val) and pd.notna(p_val):
-                    result[col] = (c_val * cur_pa + p_val * pri_pa) / total
+                    result[col] = (c_val * cur_weight) + (p_val * prior_weight)
                 elif pd.notna(c_val):
                     result[col] = float(c_val)
                 elif pd.notna(p_val):
@@ -321,6 +342,8 @@ def get_pitcher_stuff(name_norm: str,
                     result[col] = np.nan
             result["BB_pct"] = np.nan
             result["Throws"] = r_cur.get("Throws") or r_pri.get("Throws")
+            result["GS"] = r_cur.get("GS", np.nan)
+            result["pa"] = cur_pa
             return result
 
     # Pitcher not found — team median fallback
@@ -336,6 +359,8 @@ def get_pitcher_stuff(name_norm: str,
             result[col] = np.nan
     result["BB_pct"] = np.nan
     result["Throws"] = None
+    result["GS"] = np.nan
+    result["pa"] = np.nan
     return result
 
 

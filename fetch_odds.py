@@ -56,6 +56,8 @@ ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
 
 # The Odds API team name → our abbreviation
 ODDS_TEAM_MAP = {
+    "OAK":                       "ATH",
+    "ATH":                       "ATH",
     "Arizona Diamondbacks":      "ARI",
     "Atlanta Braves":            "ATL",
     "Baltimore Orioles":         "BAL",
@@ -75,7 +77,7 @@ ODDS_TEAM_MAP = {
     "Minnesota Twins":           "MIN",
     "New York Mets":             "NYM",
     "New York Yankees":          "NYY",
-    "Oakland Athletics":         "OAK",
+    "Oakland Athletics": "ATH",
     "Philadelphia Phillies":     "PHI",
     "Pittsburgh Pirates":        "PIT",
     "San Diego Padres":          "SDP",
@@ -89,8 +91,8 @@ ODDS_TEAM_MAP = {
     # Aliases
     "Cleveland Indians":         "CLE",
     "Anaheim Angels":            "LAA",
-    "Sacramento River Cats":     "OAK",
-    "Athletics":                 "OAK",
+    "Sacramento River Cats": "ATH",
+    "Athletics": "ATH",
 }
 
 
@@ -230,10 +232,11 @@ def fetch_mlb_odds(api_key: str = ODDS_API_KEY,
 
 def load_or_fetch_odds(game_date: str | None = None,
                        api_key: str = ODDS_API_KEY,
-                       cache_path: str = CACHE_PATH) -> pd.DataFrame:
+                       cache_path: str = CACHE_PATH,
+                       expected_games: int | None = None,
+                       force_refresh: bool = False) -> pd.DataFrame:
     """
-    Return odds for game_date from the cache if already fetched today;
-    otherwise hit the API, append to cache, and return.
+    Return odds for game_date from cache, refreshing if cache is empty or partial.
     """
     if game_date is None:
         game_date = date.today().isoformat()
@@ -242,7 +245,12 @@ def load_or_fetch_odds(game_date: str | None = None,
     if os.path.exists(cache_path):
         cached = pd.read_csv(cache_path, dtype={"game_date": str})
         day_rows = cached[cached["game_date"] == game_date]
-        if not day_rows.empty:
+        cache_complete = (
+            not day_rows.empty
+            and not force_refresh
+            and (expected_games is None or len(day_rows) >= expected_games)
+        )
+        if cache_complete:
             return day_rows.reset_index(drop=True)
     else:
         cached = pd.DataFrame()
@@ -250,16 +258,17 @@ def load_or_fetch_odds(game_date: str | None = None,
     # Fetch from API
     fresh = fetch_mlb_odds(api_key=api_key, game_date=game_date)
     if fresh.empty:
-        return fresh
+        return day_rows.reset_index(drop=True) if "day_rows" in locals() else fresh
 
-    # Append and save
+    # Append/merge and save. This lets later API calls fill games that were not
+    # posted when the first partial cache was created.
     combined = (pd.concat([cached, fresh], ignore_index=True)
                   .drop_duplicates(["game_date", "home_team", "away_team"])
                   .sort_values(["game_date", "home_team"])
                   .reset_index(drop=True))
     combined.to_csv(cache_path, index=False)
     print(f"  Saved {len(combined):,} rows → {cache_path}")
-    return fresh
+    return combined[combined["game_date"] == game_date].reset_index(drop=True)
 
 
 def get_home_implied_prob(home_team: str,

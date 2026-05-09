@@ -39,7 +39,7 @@ RETRO_TO_ABBREV = {
     "COL": "COL", "DET": "DET", "HOU": "HOU", "KCA": "KCR",
     "ANA": "LAA", "LAA": "LAA", "LAN": "LAD", "MIA": "MIA",
     "FLO": "MIA", "MIL": "MIL", "MIN": "MIN", "NYN": "NYM",
-    "NYA": "NYY", "OAK": "OAK", "PHI": "PHI", "PIT": "PIT",
+    "NYA": "NYY", "OAK": "ATH", "PHI": "PHI", "PIT": "PIT",
     "SDN": "SDP", "SEA": "SEA", "SFN": "SFG", "SLN": "STL",
     "TBA": "TBR", "TEX": "TEX", "TOR": "TOR", "WAS": "WSN",
 }

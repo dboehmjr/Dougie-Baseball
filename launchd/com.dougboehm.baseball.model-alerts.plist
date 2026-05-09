@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dougboehm.baseball.model-alerts</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/dougboehm/Baseball Code/win_probability/scripts/run_model_alerts.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/dougboehm/Baseball Code/win_probability</string>
+
+  <key>StartInterval</key>
+  <integer>1800</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/dougboehm/Baseball Code/win_probability/logs/launchd_model_alerts.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/dougboehm/Baseball Code/win_probability/logs/launchd_model_alerts.err.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

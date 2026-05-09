@@ -39,7 +39,7 @@ HEADERS = {
 
 AN_ABBREV_MAP = {
     "KC":  "KCR", "SD":  "SDP", "TB":  "TBR", "SF":  "SFG",
-    "WSH": "WSN", "CWS": "CHW", "AZ":  "ARI", "ATH": "OAK",
+    "WSH": "WSN", "CWS": "CHW", "AZ":  "ARI", "OAK": "ATH", "ATH": "ATH",
 }
 
 SEASON_DATES = {

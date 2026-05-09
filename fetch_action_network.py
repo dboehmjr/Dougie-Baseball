@@ -29,7 +29,7 @@ BOOK_IDS = "15,30,76,123,69"
 AN_MAP = {
     "WSH": "WSN", "SD":  "SDP", "TB":  "TBR",
     "KC":  "KCR", "AZ":  "ARI", "SF":  "SFG",
-    "ATH": "OAK", "CWS": "CHW",
+    "OAK": "ATH", "ATH": "ATH", "CWS": "CHW",
 }
 
 os.makedirs(DATA_DIR, exist_ok=True)

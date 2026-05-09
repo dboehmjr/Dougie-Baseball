@@ -82,11 +82,20 @@ class BettingPolicy:
         if bucket is None:
             return None
         phase = season_phase or "all"
+        # Exact match (bucket + phase)
         for rule in self.rules:
             if rule.bucket == bucket and rule.season_phase == phase:
                 return rule
+        # Exact bucket, phase wildcard
         for rule in self.rules:
             if rule.bucket == bucket and rule.season_phase == "all":
+                return rule
+        # Bucket wildcard "all" matches any odds bucket
+        for rule in self.rules:
+            if rule.bucket == "all" and rule.season_phase == phase:
+                return rule
+        for rule in self.rules:
+            if rule.bucket == "all" and rule.season_phase == "all":
                 return rule
         return None
 

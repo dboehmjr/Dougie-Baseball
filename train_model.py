@@ -71,14 +71,16 @@ FEATURE_COLS = [
     "home_sp_inseason_era",
     "away_sp_inseason_era",
     "sp_inseason_era_diff",
+    # In-season rolling SP ERA (last 3 starts) — recent form signal
+    "home_sp_last3_era",
+    "away_sp_last3_era",
+    "sp_last3_era_diff",
     "home_bullpen_inseason_era",
     "away_bullpen_inseason_era",
     "bullpen_inseason_era_diff",
-    "park_factor",
     # Rest & travel
     "home_days_rest",
     "away_days_rest",
-    "rest_diff",
     "away_travel_miles",
     "travel_diff",
     # Head-to-head history (last 10 meetings)
@@ -103,15 +105,13 @@ FEATURE_COLS = [
     "home_lineup_ops_vs_sp",
     "away_lineup_ops_vs_sp",
     "lineup_ops_vs_sp_diff",
-    "home_lineup_known_batters",
-    "away_lineup_known_batters",
-    "lineup_known_batters_diff",
-    # Starting pitcher handedness context
-    "home_opp_sp_is_lhp",
-    "away_opp_sp_is_lhp",
-    "home_sp_is_lhp",
-    "away_sp_is_lhp",
-    "both_sp_same_hand",
+    # Lineup OPS vs LHP/RHP separately (handedness split signal)
+    "home_lineup_ops_vs_lhp",
+    "home_lineup_ops_vs_rhp",
+    "away_lineup_ops_vs_lhp",
+    "away_lineup_ops_vs_rhp",
+    "lineup_ops_vs_lhp_diff",
+    "lineup_ops_vs_rhp_diff",
     # Prior-season Pythagorean win% (stable team quality anchor)
     "home_prior_win_pct",
     "away_prior_win_pct",
@@ -144,16 +144,9 @@ FEATURE_COLS = [
     "park_rf_dist",
     "park_lf_wall_ht",
     "park_altitude_ft",
-    # SP pitch stuff (prior-season FanGraphs: velocity, whiff rate, K%, xFIP)
+    # SP pitch stuff (prior-season FanGraphs: velocity, xFIP)
     "home_sp_fbv",
     "away_sp_fbv",
-    "sp_fbv_diff",
-    "home_sp_swstr",
-    "away_sp_swstr",
-    "sp_swstr_diff",
-    "home_sp_k_pct",
-    "away_sp_k_pct",
-    "sp_k_pct_diff",
     "home_sp_xfip",
     "away_sp_xfip",
     "sp_xfip_diff",
@@ -161,20 +154,23 @@ FEATURE_COLS = [
     "home_sp_pa",
     "away_sp_pa",
     "sp_pa_diff",
-    # SP workload: days since last start + outs thrown in last start
-    "home_sp_days_rest",
-    "away_sp_days_rest",
-    "sp_days_rest_diff",
+    # SP workload: outs thrown in last start
     "home_sp_outs_last",
     "away_sp_outs_last",
     "sp_outs_last_diff",
     # Prior-season Statcast power metrics (barrel rate, hard hit%)
-    "home_barrel_pct",
-    "away_barrel_pct",
     "barrel_pct_diff",
     "home_hard_hit_pct",
     "away_hard_hit_pct",
     "hard_hit_pct_diff",
+    # Home/away venue split run differential
+    "home_home_rd",
+    "away_away_rd",
+    "rd_venue_diff",
+    # Calendar timing: known pre-game; helps early-season calibration
+    "game_month",
+    "game_day_of_year",
+    "is_early_season",
     # Market-aware feature. Excluded from the primary edge model.
     "vegas_home_prob",
 ]
@@ -206,27 +202,40 @@ def load_and_split(path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 # ---------------------------------------------------------------------------
 
 XGB_PARAM_GRID = {
-    "model__n_estimators":      [200, 400, 600],
-    "model__max_depth":         [3, 4, 5, 6],
-    "model__learning_rate":     [0.01, 0.05, 0.1],
-    "model__subsample":         [0.7, 0.8, 1.0],
-    "model__colsample_bytree":  [0.7, 0.8, 1.0],
-    "model__min_child_weight":  [1, 3, 5],
-    "model__gamma":             [0, 0.1, 0.3],
+    "n_estimators":      [200, 400, 600],
+    "max_depth":         [3, 4, 5, 6],
+    "learning_rate":     [0.01, 0.05, 0.1],
+    "subsample":         [0.7, 0.8, 1.0],
+    "colsample_bytree":  [0.7, 0.8, 1.0],
+    "min_child_weight":  [1, 3, 5],
+    "gamma":             [0, 0.1, 0.3],
 }
 
 
-def build_xgb_pipeline() -> Pipeline:
-    xgb = XGBClassifier(
+def make_sample_weights(years: pd.Series) -> np.ndarray:
+    """
+    Upweight recent seasons to reduce distribution shift from rule changes.
+    2023+ (shift ban + pitch clock): 3x
+    2022: 2x
+    2020-2021: 1.5x
+    pre-2020: 1x
+    """
+    w = np.ones(len(years), dtype=float)
+    w[years.values >= 2023] = 3.0
+    w[years.values == 2022] = 2.0
+    w[(years.values >= 2020) & (years.values <= 2021)] = 1.5
+    return w
+
+
+def build_xgb_model() -> XGBClassifier:
+    # XGBoost handles NaN natively (no imputer needed) — cleaner and lets
+    # sample_weight flow without Pipeline routing complications.
+    return XGBClassifier(
         objective="binary:logistic",
         eval_metric="logloss",
         random_state=42,
-        n_jobs=2,          # limit to 2 cores — prevents overheating
+        n_jobs=2,
     )
-    return Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("model",   xgb),
-    ])
 
 
 def _calibrated_classifier(estimator, n_splits: int = 5) -> CalibratedClassifierCV:
@@ -238,40 +247,43 @@ def _calibrated_classifier(estimator, n_splits: int = 5) -> CalibratedClassifier
         return CalibratedClassifierCV(base_estimator=estimator, method="isotonic", cv=cv)
 
 
-def tune_and_fit(X_train: pd.DataFrame, y_train: pd.Series) -> Pipeline:
+def tune_and_fit(X_train: pd.DataFrame, y_train: pd.Series,
+                  train_years: pd.Series | None = None):
     """
-    RandomizedSearchCV with TimeSeriesSplit — later folds always predict
-    games that come after the training window.
+    RandomizedSearchCV with TimeSeriesSplit + sample weights for recent seasons.
+    Tune on log loss because this model is used as a probability forecaster;
+    AUC only measures ranking and can preserve overconfident probabilities.
+    XGBoost handles NaN natively — no imputer pipeline needed.
     """
-    base_pipeline = build_xgb_pipeline()
+    weights = make_sample_weights(train_years) if train_years is not None else None
 
-    tscv = TimeSeriesSplit(n_splits=3)   # reduced from 5 to save time/memory
+    tscv = TimeSeriesSplit(n_splits=3)
 
     search = RandomizedSearchCV(
-        base_pipeline,
+        build_xgb_model(),
         param_distributions=XGB_PARAM_GRID,
-        n_iter=15,             # reduced from 30 — still finds good params
-        scoring="roc_auc",
+        n_iter=15,
+        scoring="neg_log_loss",
         cv=tscv,
         random_state=42,
-        n_jobs=1,              # run folds sequentially — prevents memory spikes
+        n_jobs=1,
         verbose=1,
     )
 
     print("Running hyperparameter search (15 iterations × 3 folds)...")
-    search.fit(X_train, y_train)
+    fit_kwargs = {"sample_weight": weights} if weights is not None else {}
+    search.fit(X_train, y_train, **fit_kwargs)
 
     best_idx = search.best_index_
-    cv_scores = search.cv_results_["mean_test_score"]
-    cv_stds   = search.cv_results_["std_test_score"]
+    cv_stds  = search.cv_results_["std_test_score"]
     print(f"\nBest params:   {search.best_params_}")
-    print(f"Best CV AUC:   {search.best_score_:.4f}  ± {cv_stds[best_idx]:.4f}")
+    print(f"Best CV log loss: {-search.best_score_:.4f}  ± {cv_stds[best_idx]:.4f}")
 
-    # Calibrate the best estimator with isotonic regression
-    best = search.best_estimator_
+    # Calibrate with isotonic regression, passing same weights
+    best      = search.best_estimator_
     calibrated = _calibrated_classifier(best)
-    print("\nCalibrating probabilities...")
-    calibrated.fit(X_train, y_train)
+    print("\nCalibrating probabilities (with sample weights)...")
+    calibrated.fit(X_train, y_train, **fit_kwargs)
 
     return calibrated
 
@@ -350,7 +362,7 @@ def plot_feature_importance(model, feature_cols: list[str], suffix: str = "") ->
     try:
         # Pull importance from one of the calibrated XGB estimators
         base = _get_base_estimator(model)
-        xgb_clf = base.named_steps["model"]
+        xgb_clf = base.named_steps["model"] if hasattr(base, "named_steps") else base
         importance = xgb_clf.feature_importances_
         n = min(len(importance), len(feature_cols))
         imp_df = pd.DataFrame({
@@ -419,7 +431,7 @@ if __name__ == "__main__":
         X_train = train[feat_cols]
         X_test  = test[feat_cols]
 
-        xgb_model = tune_and_fit(X_train, y_train)
+        xgb_model = tune_and_fit(X_train, y_train, train_years=train["year"])
         metrics_xgb = compute_metrics(
             f"XGBoost ({spec['label']}, tuned + calibrated)",
             xgb_model, X_test, y_test,

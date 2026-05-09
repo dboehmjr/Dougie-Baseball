@@ -93,152 +93,91 @@ def flat_profit(odds: float, won: bool) -> float:
 
 
 def tune_policy(prior_records: list[pd.DataFrame], test_year: int) -> tuple[BettingPolicy, pd.DataFrame]:
-    """Tune odds/edge rules using only earlier out-of-sample seasons."""
-    fallback_policy = BettingPolicy(
-        rules=(PolicyRule("+130:+170", 0.06),),
-        name="fallback_static_underdog_130_170",
-    )
+    """
+    Tune one edge threshold per odds bucket using all prior out-of-sample seasons.
+    No season-phase splits — pool all phases within each bucket.
+    Only buckets that are profitable in the majority of prior years are kept.
+    Falls back to +130:+170 > 6% when insufficient prior data.
+    """
+    FALLBACK_RULE   = PolicyRule("+130:+170", 0.06)
+    MIN_BUCKET_BETS = 30    # minimum pooled bets per bucket to tune
+    ALL_THRESHOLDS  = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10]
+
+    fallback = BettingPolicy(rules=(FALLBACK_RULE,), name="fallback_underdog_130_170_6pct")
+
     if not prior_records:
-        policy = BettingPolicy(
-            rules=(PolicyRule("+130:+170", 0.06),),
-            name="bootstrap_static_underdog_130_170",
-        )
-        return policy, pd.DataFrame([{
-            "test_year": test_year,
-            "season_phase": "all",
-            "odds_bucket": "+130:+170",
-            "edge_threshold": 0.06,
-            "prior_bets": 0,
-            "prior_flat_roi": np.nan,
-            "policy_name": policy.name,
-            "reason": "bootstrap: no prior walk-forward seasons",
+        return fallback, pd.DataFrame([{
+            "test_year": test_year, "odds_bucket": FALLBACK_RULE.bucket,
+            "edge_threshold": FALLBACK_RULE.min_edge, "prior_bets": 0,
+            "prior_flat_roi": np.nan, "policy_name": fallback.name,
+            "reason": "bootstrap: no prior seasons",
         }])
 
     prior = pd.concat(prior_records, ignore_index=True)
     prior = prior.dropna(subset=["edge", "odds", "won", "odds_bucket"]).copy()
-    if "season_phase" not in prior.columns:
-        prior["season_phase"] = prior["date"].map(season_phase)
     prior["won"] = prior["won"].astype(bool)
     prior_years = sorted(prior["year"].dropna().astype(int).unique())
-    if len(prior_years) < 2:
-        return fallback_policy, pd.DataFrame([{
-            "test_year": test_year,
-            "season_phase": "all",
-            "odds_bucket": "+130:+170",
-            "edge_threshold": 0.06,
-            "prior_bets": int(len(prior)),
-            "prior_flat_roi": np.nan,
-            "policy_name": fallback_policy.name,
-            "reason": "fallback: fewer than two prior walk-forward seasons",
-        }])
-    recent_year = prior_years[-1]
+    n_years = len(prior_years)
 
     rules: list[PolicyRule] = []
     rows: list[dict] = []
 
-    for phase in SEASON_PHASES:
-        phase_df = prior[prior["season_phase"] == phase]
-        for bucket in ODDS_BUCKETS:
-            bucket_df = phase_df[phase_df["odds_bucket"] == bucket]
-            best = None
-            for threshold in EDGE_THRESHOLDS:
-                bets = bucket_df[bucket_df["edge"] > threshold].copy()
-                n = len(bets)
-                if n < MIN_TUNE_BETS:
-                    continue
-                pnl = sum(flat_profit(float(r["odds"]), bool(r["won"])) for _, r in bets.iterrows())
-                roi = pnl / n if n else np.nan
-                yearly = []
-                for year, year_bets in bets.groupby("year"):
-                    year_pnl = sum(
-                        flat_profit(float(r["odds"]), bool(r["won"]))
-                        for _, r in year_bets.iterrows()
-                    )
-                    yearly.append({
-                        "year": int(year),
-                        "bets": int(len(year_bets)),
-                        "roi": year_pnl / len(year_bets) if len(year_bets) else np.nan,
-                    })
-                recent = next((r for r in yearly if r["year"] == recent_year), None)
-                supported_years = [
-                    r for r in yearly
-                    if r["bets"] >= MIN_YEAR_BETS and r["roi"] >= -0.02
-                ]
-                if (
-                    recent is None
-                    or recent["bets"] < MIN_RECENT_BETS
-                    or recent["roi"] < 0
-                    or len(supported_years) < 2
-                ):
-                    continue
-                score = roi * min(1.0, n / 200)
-                candidate = {
-                    "test_year": test_year,
-                    "season_phase": phase,
-                    "odds_bucket": bucket,
-                    "edge_threshold": threshold,
-                    "prior_bets": n,
-                    "prior_flat_pnl": pnl,
-                    "prior_flat_roi": roi,
-                    "recent_year": recent_year,
-                    "recent_bets": recent["bets"],
-                    "recent_flat_roi": recent["roi"],
-                    "supported_years": len(supported_years),
-                    "score": score,
-                }
-                if best is None or candidate["score"] > best["score"]:
-                    best = candidate
-            if best is None:
-                rows.append({
-                    "test_year": test_year,
-                    "season_phase": phase,
-                    "odds_bucket": bucket,
-                    "edge_threshold": np.nan,
-                    "prior_bets": int(len(bucket_df)),
-                    "prior_flat_pnl": np.nan,
-                    "prior_flat_roi": np.nan,
-                    "score": np.nan,
-                    "selected": False,
-                    "policy_name": None,
-                    "reason": f"fewer than {MIN_TUNE_BETS} prior qualifying bets",
-                })
+    for bucket in ODDS_BUCKETS:
+        bucket_df = prior[prior["odds_bucket"] == bucket]
+        best = None
+
+        for threshold in ALL_THRESHOLDS:
+            bets = bucket_df[bucket_df["edge"] > threshold].copy()
+            n = len(bets)
+            if n < MIN_BUCKET_BETS:
                 continue
-            selected = best["prior_flat_roi"] >= MIN_TUNE_ROI
-            if selected:
-                rules.append(PolicyRule(bucket, float(best["edge_threshold"]), phase))
+
+            pnl = sum(flat_profit(float(r["odds"]), bool(r["won"])) for _, r in bets.iterrows())
+            roi = pnl / n
+
+            profitable_years = sum(
+                1 for _, yb in bets.groupby("year")
+                if sum(flat_profit(float(r["odds"]), bool(r["won"])) for _, r in yb.iterrows()) / len(yb) > 0
+            )
+
+            score = roi * min(1.0, n / 300)
+            candidate = {
+                "test_year": test_year,
+                "odds_bucket": bucket,
+                "edge_threshold": threshold,
+                "prior_bets": n,
+                "prior_flat_roi": round(roi, 4),
+                "profitable_years": profitable_years,
+                "total_years": n_years,
+                "score": round(score, 4),
+                "reason": "candidate",
+            }
+
+            # Require positive ROI and profitable in most prior years
+            if roi > 0 and profitable_years >= max(1, n_years - 1):
+                if best is None or score > best["score"]:
+                    best = candidate
+
+        if best is None:
             rows.append({
-                **best,
-                "selected": selected,
-                "policy_name": None,
-                "reason": "selected" if selected else f"prior ROI below {MIN_TUNE_ROI:.0%}",
+                "test_year": test_year, "odds_bucket": bucket,
+                "edge_threshold": np.nan, "prior_bets": int(len(bucket_df)),
+                "prior_flat_roi": np.nan, "reason": "no profitable threshold found",
             })
+            continue
+
+        rules.append(PolicyRule(bucket, best["edge_threshold"]))
+        rows.append({**best, "reason": "selected"})
 
     name = f"walkforward_tuned_through_{test_year - 1}"
     rows_df = pd.DataFrame(rows)
+
     if not rules:
-        fallback_row = {
-            "test_year": test_year,
-            "season_phase": "all",
-            "odds_bucket": "+130:+170",
-            "edge_threshold": 0.06,
-            "prior_bets": int(len(prior)),
-            "prior_flat_pnl": np.nan,
-            "prior_flat_roi": np.nan,
-            "recent_year": recent_year,
-            "recent_bets": np.nan,
-            "recent_flat_roi": np.nan,
-            "supported_years": np.nan,
-            "score": np.nan,
-            "selected": True,
-            "policy_name": fallback_policy.name,
-            "reason": "fallback: no stable phase-specific rule selected",
-        }
-        rows_df = pd.concat([rows_df, pd.DataFrame([fallback_row])], ignore_index=True)
-        return fallback_policy, rows_df
+        rows_df["policy_name"] = fallback.name
+        return fallback, rows_df
 
     policy = BettingPolicy(rules=tuple(rules), name=name)
-    if not rows_df.empty:
-        rows_df["policy_name"] = name
+    rows_df["policy_name"] = name
     return policy, rows_df
 
 

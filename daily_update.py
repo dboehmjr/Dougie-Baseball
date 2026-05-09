@@ -39,7 +39,26 @@ SEASON_START       = date(2026, 3, 18)
 MLB_ABBREV_MAP = {
     "WSH": "WSN", "SD": "SDP", "TB": "TBR",
     "KC": "KCR", "AZ": "ARI", "SF": "SFG",
-    "ATH": "OAK", "CWS": "CHW",
+    "OAK": "ATH", "ATH": "ATH", "CWS": "CHW",
+}
+
+MLB_TEAM_NAME_MAP = {
+    "Arizona Diamondbacks": "ARI", "Atlanta Braves": "ATL",
+    "Baltimore Orioles": "BAL", "Boston Red Sox": "BOS",
+    "Chicago Cubs": "CHC", "Chicago White Sox": "CHW",
+    "Cincinnati Reds": "CIN", "Cleveland Guardians": "CLE",
+    "Colorado Rockies": "COL", "Detroit Tigers": "DET",
+    "Houston Astros": "HOU", "Kansas City Royals": "KCR",
+    "Los Angeles Angels": "LAA", "Los Angeles Dodgers": "LAD",
+    "Miami Marlins": "MIA", "Milwaukee Brewers": "MIL",
+    "Minnesota Twins": "MIN", "New York Mets": "NYM",
+    "New York Yankees": "NYY", "Oakland Athletics": "ATH",
+    "Athletics": "ATH", "Philadelphia Phillies": "PHI",
+    "Pittsburgh Pirates": "PIT", "San Diego Padres": "SDP",
+    "Seattle Mariners": "SEA", "San Francisco Giants": "SFG",
+    "St. Louis Cardinals": "STL", "Tampa Bay Rays": "TBR",
+    "Texas Rangers": "TEX", "Toronto Blue Jays": "TOR",
+    "Washington Nationals": "WSN",
 }
 
 # Transaction type codes we care about
@@ -56,7 +75,30 @@ TRANSACTION_TYPES = {
 
 
 def _abbrev(raw: str) -> str:
-    return MLB_ABBREV_MAP.get(raw.upper(), raw.upper())
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+    if raw in MLB_TEAM_NAME_MAP:
+        return MLB_TEAM_NAME_MAP[raw]
+    abbr = MLB_ABBREV_MAP.get(raw.upper(), raw.upper())
+    if abbr in set(MLB_TEAM_NAME_MAP.values()):
+        return abbr
+    return ""
+
+
+def _transaction_team(team_obj: dict | None) -> str:
+    if not team_obj:
+        return ""
+    return _abbrev(team_obj.get("abbreviation") or team_obj.get("name") or "")
+
+
+def _transaction_mlb_team(from_team: str, to_team: str) -> str:
+    mlb_teams = set(MLB_TEAM_NAME_MAP.values())
+    if to_team in mlb_teams:
+        return to_team
+    if from_team in mlb_teams:
+        return from_team
+    return ""
 
 
 def _get(url: str, params: dict | None = None, retries: int = 3) -> dict:
@@ -171,11 +213,11 @@ def fetch_transactions(days_back: int = 7) -> pd.DataFrame:
         if not type_label:
             continue
 
-        from_team_raw = (t.get("fromTeam") or {}).get("abbreviation", "")
-        to_team_raw   = (t.get("toTeam")   or {}).get("abbreviation", "")
-        from_team = _abbrev(from_team_raw) if from_team_raw else ""
-        to_team   = _abbrev(to_team_raw)   if to_team_raw   else ""
-        team      = from_team or to_team
+        from_team = _transaction_team(t.get("fromTeam"))
+        to_team   = _transaction_team(t.get("toTeam"))
+        team      = _transaction_mlb_team(from_team, to_team)
+        if not team:
+            continue
 
         player    = (t.get("person") or {}).get("fullName", "Unknown")
         desc      = t.get("typeDesc") or type_label
@@ -199,6 +241,24 @@ def fetch_transactions(days_back: int = 7) -> pd.DataFrame:
         df.to_csv(TRANSACTIONS_PATH, index=False)
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# 2b. Pitcher game logs (MLB Stats API) — current season only
+# ---------------------------------------------------------------------------
+
+def run_pitcher_game_logs_fetch() -> bool:
+    """Fetch/refresh pitcher game logs (outs, runs) for the current season."""
+    try:
+        from fetch_pitcher_game_logs_live import fetch_and_save, SEASON_START
+        from datetime import date as _date, timedelta
+        through = _date.today() - timedelta(days=1)
+        n_logs, n_sp = fetch_and_save(SEASON_START, through)
+        print(f"  Pitcher logs refreshed: {n_logs} new log rows, {n_sp} new SP rows")
+        return True
+    except Exception as exc:
+        print(f"  Pitcher game logs fetch FAILED: {exc}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +568,24 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"  ERROR fetching transactions: {e}")
         tx_df = pd.DataFrame()
+
+    # Step 2b: pitcher game logs (for SP/bullpen ERA features)
+    print("\n[2b/9] Fetching pitcher game logs (MLB Stats API)…")
+    run_pitcher_game_logs_fetch()
+
+    # Step 2c: historical lineups (for lineup OPS vs LHP/RHP)
+    print("\n[2c/9] Fetching historical lineups (MLB Stats API)…")
+    try:
+        from fetch_historical_lineups import fetch_historical_lineups
+        from datetime import date as _date
+        year = _date.today().year
+        fetch_historical_lineups(
+            start_date=f"{year}-01-01",
+            end_date=str(_date.today() - timedelta(days=1)),
+        )
+        print(f"  Historical lineups refreshed")
+    except Exception as exc:
+        print(f"  Historical lineups fetch FAILED: {exc}")
 
     # Step 3: SP pitch stuff (FanGraphs)
     print("\n[3/9] Refreshing SP pitch stuff (FanGraphs)…")
