@@ -7,6 +7,8 @@ Pages:
   3. Bankroll Tracker — log results, track P&L over time
 """
 
+from __future__ import annotations
+
 import os
 import re
 import shutil
@@ -16,6 +18,7 @@ import warnings
 import requests
 import zoneinfo
 from datetime import date, timedelta, datetime
+from math import ceil
 from typing import Optional
 
 import numpy as np
@@ -35,7 +38,8 @@ from fetch_odds import load_or_fetch_odds, get_home_implied_prob, get_moneyline_
 from fetch_lineups import fetch_confirmed_lineups
 from fetch_weather import wind_to_cf, FULL_DOME
 from fetch_pitcher_stuff import get_pitcher_stuff
-from betting_strategy import choose_bet, load_policy
+from betting_strategy import load_policy
+import database as db
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -79,6 +83,49 @@ def kelly_stake(p: float, bankroll: float, frac: float = 0.25,
         return 0.0
     k = frac * (edge / net)
     return round(min(k, max_pct) * bankroll, 2)
+
+
+def slate_bet_quota(game_count: int) -> int:
+    if game_count <= 0:
+        return 0
+    return max(1, min(3, ceil(game_count * 0.20)))
+
+
+def apply_slate_bet_ranking(rows: list[dict], bankroll: float, kelly_frac: float) -> list[dict]:
+    """Keep the top edge-quality picks for the slate and compute final stakes."""
+    quota = slate_bet_quota(len(rows))
+    eligible = [
+        idx for idx, row in enumerate(rows)
+        if row.get("has_edge") and not pd.isna(row.get("expected_roi", np.nan))
+    ]
+    eligible.sort(key=lambda idx: rows[idx].get("expected_roi", -999), reverse=True)
+    selected = set(eligible[:quota])
+
+    for idx, row in enumerate(rows):
+        row["slate_quota"] = quota
+        if idx not in selected:
+            if row.get("has_edge"):
+                row["policy_reason"] = f"outside top {quota} slate-ranked picks"
+            row["has_edge"] = False
+            row["stake"] = 0.0
+            row["to_win"] = 0.0
+            if row.get("won") is not None:
+                row["pnl"] = 0.0
+            continue
+
+        stake_prob = row.get("quality_prob")
+        if pd.isna(stake_prob):
+            stake_prob = row.get("bet_prob", 0.0)
+        stake = kelly_stake(float(stake_prob), bankroll, kelly_frac, ml=float(row.get("pick_odds", -110)))
+        row["stake"] = stake
+        odds = float(row.get("pick_odds", -110))
+        if odds > 0:
+            row["to_win"] = round(stake + stake * odds / 100, 2)
+        else:
+            row["to_win"] = round(stake + stake * 100 / abs(odds), 2) if odds != 0 else 0.0
+        if row.get("won") is not None:
+            row["pnl"] = pnl_from_odds(stake, odds, bool(row["won"]))
+    return rows
 
 
 def confidence_color(conf: float) -> str:
@@ -178,6 +225,10 @@ def get_prediction(home: str, away: str, year: int, game_date: str,
                            verbose=False)
 
 
+def is_unknown_starter(name: str | None) -> bool:
+    return str(name or "").strip().lower() in {"", "tbd", "tb/a", "to be determined", "unknown"}
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def load_odds_for_date(game_date: str, expected_games: Optional[int] = None) -> pd.DataFrame:
     """Load Vegas moneylines for a game date (cached 15 min)."""
@@ -200,19 +251,20 @@ def load_lineups_for_date(game_date: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_pitcher_stuff() -> pd.DataFrame:
-    """Load FanGraphs pitcher stuff CSV."""
+    """Load pitcher stuff from mlb.db, falling back to the legacy CSV."""
     stuff_path = os.path.join(DATA_DIR, "pitcher_stuff.csv")
-    if not os.path.exists(stuff_path):
-        return pd.DataFrame()
-    return pd.read_csv(stuff_path)
+    df = db.read_table_or_csv("pitcher_stuff", stuff_path)
+    return df.rename(columns={
+        "throws": "Throws", "fbv": "FBv", "swstr_pct": "SwStr_pct",
+        "k_pct": "K_pct", "xfip": "xFIP", "gs": "GS",
+    })
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_weather_data() -> pd.DataFrame:
     weather_path = os.path.join(DATA_DIR, "weather.csv")
-    if not os.path.exists(weather_path):
-        return pd.DataFrame()
-    return pd.read_csv(weather_path)
+    df = db.read_table_or_csv("game_weather", weather_path, parse_dates=["date"])
+    return df.rename(columns={"game_date": "date"})
 
 
 def _normalize_sp_name(name: str) -> str:
@@ -272,6 +324,9 @@ def generate_key_factors(r: dict, home_stuff: dict, away_stuff: dict,
     factors = []
     home, away, pick = r["home"], r["away"], r["pick"]
 
+    if r.get("starter_tbd"):
+        factors.append("Starter TBD: model probability is lower-confidence and market edge is hidden until starters are confirmed")
+
     # Pitching edge
     h_xfip = home_stuff.get("xFIP")
     a_xfip = away_stuff.get("xFIP")
@@ -292,7 +347,7 @@ def generate_key_factors(r: dict, home_stuff: dict, away_stuff: dict,
 
     # Market edge
     edge = r.get("pick_edge", 0) or 0
-    if edge >= 0.05:
+    if not r.get("starter_tbd") and edge >= 0.05:
         factors.append(
             f"Market edge: model is {edge:.1%} above Vegas on {pick}"
         )
@@ -304,7 +359,7 @@ def generate_key_factors(r: dict, home_stuff: dict, away_stuff: dict,
                 f"Value play, not a strong favorite: model has {pick} "
                 f"{r['conf']:.1%} vs Vegas {vegas_pick:.1%}"
             )
-    elif edge <= -0.05:
+    elif not r.get("starter_tbd") and edge <= -0.05:
         factors.append(
             f"Market caution: model is {abs(edge):.1%} below Vegas on {pick}"
         )
@@ -327,7 +382,7 @@ def generate_key_factors(r: dict, home_stuff: dict, away_stuff: dict,
                 factors.append(f"{team} offense cooling off (run diff {mom:.1f} over last 7 vs 15 games)")
 
     # Home underdog value
-    if pick == home and r.get("vegas_prob", 0.5) < 0.5 and r["home%"] > 0.52:
+    if not r.get("starter_tbd") and pick == home and r.get("vegas_prob", 0.5) < 0.5 and r["home%"] > 0.52:
         factors.append(f"Home underdog value: model gives {home} {r['home%']:.1%} despite Vegas having them as dog")
 
     # Weather
@@ -377,12 +432,26 @@ def backup_user_history_file(path: str, stem: str) -> None:
 
 
 def load_pred_log() -> pd.DataFrame:
+    try:
+        df = db.read_table("app_predictions_log")
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"])
+            return df
+    except Exception:
+        pass
     if os.path.exists(PRED_LOG_PATH):
-        return pd.read_csv(PRED_LOG_PATH, parse_dates=["date"])
+        df = pd.read_csv(PRED_LOG_PATH, parse_dates=["date"])
+        conn = db.get_connection()
+        db.replace_table(df, "app_predictions_log", conn)
+        conn.close()
+        return df
     return pd.DataFrame(columns=PRED_LOG_COLS)
 
 
 def save_pred_log(df: pd.DataFrame) -> None:
+    conn = db.get_connection()
+    db.replace_table(df, "app_predictions_log", conn)
+    conn.close()
     df.to_csv(PRED_LOG_PATH, index=False)
     backup_user_history_file(PRED_LOG_PATH, "predictions_log")
 
@@ -495,8 +564,22 @@ def _grade_past_predictions(log: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_ledger() -> pd.DataFrame:
+    try:
+        df = db.read_table("app_bankroll_ledger")
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"])
+            if "odds" not in df.columns:
+                df["odds"] = -110
+            if "notes" not in df.columns:
+                df["notes"] = ""
+            return df
+    except Exception:
+        pass
     if os.path.exists(LEDGER_PATH):
         df = pd.read_csv(LEDGER_PATH, parse_dates=["date"])
+        conn = db.get_connection()
+        db.replace_table(df, "app_bankroll_ledger", conn)
+        conn.close()
         if "odds" not in df.columns:
             df["odds"] = -110
         if "notes" not in df.columns:
@@ -506,6 +589,9 @@ def load_ledger() -> pd.DataFrame:
 
 
 def save_ledger(df: pd.DataFrame):
+    conn = db.get_connection()
+    db.replace_table(df, "app_bankroll_ledger", conn)
+    conn.close()
     df.to_csv(LEDGER_PATH, index=False)
     backup_user_history_file(LEDGER_PATH, "bankroll_ledger")
 
@@ -681,14 +767,19 @@ def _update_streak_from_live(team: str, last_features_date: pd.Timestamp,
 
 
 def load_team_form() -> dict[str, dict]:
-    """Return latest hot/cold stats per team from features.csv."""
+    """Return latest hot/cold stats per team from mlb.db."""
     features_path = os.path.join(DATA_DIR, "features.csv")
-    if not os.path.exists(features_path):
+    try:
+        df = db.read_table_or_csv("features", features_path, parse_dates=["Date"])
+    except Exception:
         return {}
-    df = pd.read_csv(features_path, parse_dates=["Date"])
 
     live_logs_path = os.path.join(DATA_DIR, "game_logs_live.csv")
-    live_logs = pd.read_csv(live_logs_path, parse_dates=["Date"]) if os.path.exists(live_logs_path) else None
+    live_logs = db.read_table_or_csv(
+        "game_logs", live_logs_path, parse_dates=["Date"]
+    ).rename(columns={"game_date": "Date"})
+    if not live_logs.empty and "Date" in live_logs.columns:
+        live_logs["Date"] = pd.to_datetime(live_logs["Date"], errors="coerce")
 
     form = {}
     teams = set(df["home_team"].unique()) | set(df["away_team"].unique())
@@ -743,9 +834,10 @@ def streak_badge(team: str, form: dict) -> str:
 @st.cache_data(ttl=3600)
 def load_transactions(days_back: int = 7) -> pd.DataFrame:
     tx_path = os.path.join(DATA_DIR, "transactions_live.csv")
-    if not os.path.exists(tx_path):
+    try:
+        df = db.read_table_or_csv("transactions_live", tx_path, parse_dates=["date"])
+    except Exception:
         return pd.DataFrame()
-    df = pd.read_csv(tx_path)
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -833,6 +925,7 @@ with tab1:
             p_away  = 1 - p_home
             conf    = max(p_home, p_away)
             model_pick = home if p_home >= p_away else away
+            starter_tbd = is_unknown_starter(g.get("home_sp")) or is_unknown_starter(g.get("away_sp"))
 
             # Get Vegas implied probs and moneylines
             pick_odds = -110
@@ -854,37 +947,23 @@ with tab1:
                         vegas_p_away = _imp(away_ml) / t
                         odds_are_valid = True
 
-            if odds_are_valid:
-                pick = choose_bet(
-                    home=home, away=away, p_home=p_home,
-                    home_ml=home_ml, away_ml=away_ml, vegas_home=vegas_p_home,
-                    policy=betting_policy, game_date=date_str,
-                )
-                bet_side = pick["side"]
-                bet_p = pick["model_prob"]
-                pick_odds = pick["odds"]
-                bet_edge = pick["edge"]
-                has_edge = bool(pick["should_bet"])
-                odds_bucket = pick["odds_bucket"]
-                season_phase = pick["season_phase"]
-                policy_reason = pick["policy_reason"]
-            else:
-                bet_side = home if p_home > p_away else away
-                bet_p = conf
-                pick_odds = home_ml if bet_side == home else away_ml
-                bet_edge = np.nan
-                has_edge = False
-                odds_bucket = None
-                season_phase = None
-                policy_reason = "missing odds"
+            bet_side = model_pick
+            bet_p = conf
+            pick_odds = home_ml if bet_side == home else away_ml
+            bet_edge = (
+                (p_home - vegas_p_home) if odds_are_valid and bet_side == home
+                else (p_away - vegas_p_away) if odds_are_valid
+                else np.nan
+            )
+            has_edge = False
+            odds_bucket = None
+            season_phase = None
+            policy_reason = "betting models archived; pure baseball mode"
+            quality_prob = np.nan
+            expected_roi = np.nan
 
-            stake = kelly_stake(bet_p, bankroll_slate, kelly_frac_slate, ml=pick_odds) \
-                    if has_edge else 0.0
-
-            if pick_odds > 0:
-                to_win = round(stake + stake * pick_odds / 100, 2)
-            else:
-                to_win = round(stake + stake * 100 / abs(pick_odds), 2) if pick_odds != 0 else 0.0
+            stake = 0.0
+            to_win = 0.0
 
             # Hot/cold badges
             home_badge = hot_cold_badge(home, team_form) + (" " + streak_badge(home, team_form)).rstrip()
@@ -925,7 +1004,12 @@ with tab1:
             # Vegas line
             vegas_prob = get_home_implied_prob(home, away, odds_df)
             ml_str     = get_moneyline_str(home, away, odds_df)
-            if np.isnan(vegas_prob):
+            if starter_tbd:
+                model_edge = np.nan
+                pick_edge = np.nan
+                pick_vegas_prob = np.nan
+                policy_reason = "starter TBD; market edge hidden until probable pitchers are confirmed"
+            elif np.isnan(vegas_prob):
                 model_edge = np.nan
                 pick_edge = np.nan
                 pick_vegas_prob = np.nan
@@ -948,6 +1032,8 @@ with tab1:
                 "pick":       model_pick,
                 "bet_side":   bet_side,
                 "bet_prob":   bet_p,
+                "quality_prob": quality_prob,
+                "expected_roi": expected_roi,
                 "conf":       conf,
                 "stake":      stake,
                 "to_win":     to_win,
@@ -970,10 +1056,13 @@ with tab1:
                 "home_score":    home_score,
                 "away_score":    away_score,
                 "home_win":      home_win,
+                "starter_tbd":   starter_tbd,
             })
             progress.progress((i + 1) / len(schedule), text=f"Predicting {away} @ {home}…")
 
         progress.empty()
+
+        rows = apply_slate_bet_ranking(rows, bankroll_slate, kelly_frac_slate)
 
         # Persist all predictions (and scores for finished games) silently
         log_or_update_predictions(rows, date_str)
@@ -1019,6 +1108,8 @@ with tab1:
                 row["Vegas Pick%"] = r.get("pick_vegas_prob", np.nan) * 100
                 edge = r["pick_edge"]
                 row["Edge"] = edge * 100 if not np.isnan(edge) else None
+                row["Bet Quality"] = r.get("quality_prob", np.nan) * 100
+                row["Expected ROI"] = r.get("expected_roi", np.nan) * 100
             if has_finals:
                 row["Result"] = r["result"] if r["result"] else "Pending"
                 row["P&L"]    = r["pnl"] if r["pnl"] is not None else None
@@ -1034,6 +1125,8 @@ with tab1:
                 "Model Conf":  st.column_config.NumberColumn("Model Conf", format="%.1f%%"),
                 "Vegas Pick%": st.column_config.NumberColumn("Vegas Pick%", format="%.1f%%"),
                 "Edge":        st.column_config.NumberColumn("Edge", format="%+.1f%%"),
+                "Bet Quality": st.column_config.NumberColumn("Bet Quality", format="%.1f%%"),
+                "Expected ROI": st.column_config.NumberColumn("Expected ROI", format="%+.1f%%"),
                 "Stake":       st.column_config.NumberColumn("Stake", format="$%.2f"),
                 "Payout":      st.column_config.NumberColumn("Payout", format="$%.2f"),
                 "P&L":         st.column_config.NumberColumn("P&L", format="$%+.2f"),
@@ -1046,8 +1139,13 @@ with tab1:
                 f"🟢 ≥65% confidence  🟡 58–65%  ⚪ 53–58%  |  "
                 f"🔥 heating up  ❄️ cooling down  |  "
                 f"Break-even at -110: {BREAKEVEN:.1%}  |  Kelly fraction: {kelly_frac_slate:.0%}  |  "
-                f"Bet policy: {betting_policy.name}"
+                f"Bet policy: top 20% of slate, 1-3 bets/day, ≥4% expected ROI"
                 + odds_note
+            )
+        else:
+            st.caption(
+                "Pure baseball mode: betting models are archived, so the app is showing "
+                "win probabilities without stake recommendations."
             )
 
         # ── Auto-log today's bets ─────────────────────────────────
@@ -1067,8 +1165,11 @@ with tab1:
             edge_flag = "🎯 " if r["has_edge"] else ""
             pick_pct  = f"{r['conf']:.1%}"
             edge_txt = ""
-            if r["has_edge"] and not np.isnan(r.get("model_edge", np.nan)):
-                edge_txt = f" | Bet: **{r.get('bet_side')}** ({r['model_edge']:+.1%} edge)"
+            if r["has_edge"] and not np.isnan(r.get("expected_roi", np.nan)):
+                edge_txt = (
+                    f" | Bet: **{r.get('bet_side')}** "
+                    f"({r['expected_roi']:+.1%} expected ROI)"
+                )
             label = (
                 f"{edge_flag}{r['away']} @ {r['home']}  —  {r['live_str']}  |  "
                 f"Model: **{r['pick']}** {pick_pct}{edge_txt}"
@@ -1155,8 +1256,10 @@ with tab1:
                         f"Model: `{r['away']} {ap:.1%}` vs `{r['home']} {hp:.1%}`  \n"
                         + (f"Vegas:  `{r['away']} {1-vp:.1%}` vs `{r['home']} {vp:.1%}`  \n" if not np.isnan(vp) else "")
                         + (f"Edge on model pick **{r['pick']}**: `{r['pick_edge']:+.1%}`  \n" if not np.isnan(r.get("pick_edge") or np.nan) else "")
+                        + ("Edge: `hidden - starter TBD`  \n" if r.get("starter_tbd") else "")
                         + (f"Bet side: **{r.get('bet_side')}** `{r.get('bet_prob', np.nan):.1%}` "
-                           f"(`{r['model_edge']:+.1%}` edge)  \n" if r["has_edge"] else "")
+                           f"(`{r.get('quality_prob', np.nan):.1%}` quality, "
+                           f"`{r.get('expected_roi', np.nan):+.1%}` expected ROI)  \n" if r["has_edge"] else "")
                         + f"Policy: `{r.get('policy_reason', 'n/a')}`"
                     )
 

@@ -1,7 +1,7 @@
 {
-  "model_id": "pure_baseball_blend_trees_2026-05-12T150618Z0000",
+  "model_id": "pure_baseball_blend_trees_2026-05-12T161847Z0000",
   "model_path": "/Users/dougboehm/Baseball Code/win_probability/models/win_prob_blend_trees.pkl",
-  "model_sha256": "aa81ceb49d11abd1e72096f0f9677ab739637634c24f57aae1a7c96945a7754a",
+  "model_sha256": "522ff5e5bf171ba7bad0ca3be1c821c9ab297f32822692db1f4fd3382a319be4",
   "model_type": "pure_baseball_blend_trees",
   "blend_method": "weighted_mean_probability",
   "base_models": [
@@ -19,15 +19,15 @@
   "trained_year_min": 2015,
   "trained_year_max": 2026,
   "trained_date_max": "2026-05-11",
-  "trained_at_utc": "2026-05-12T15:06:18+00:00",
-  "python": "3.11.13",
+  "trained_at_utc": "2026-05-12T16:18:47+00:00",
+  "python": "3.9.12",
   "packages": {
-    "catboost": "1.2.10",
+    "catboost": "1.1.1",
     "lightgbm": "4.6.0",
     "xgboost": "2.1.4",
-    "scikit-learn": "1.8.0",
+    "scikit-learn": "1.0.2",
     "pandas": "2.3.3",
     "numpy": "1.26.4",
-    "scipy": "1.17.1"
+    "scipy": "1.7.3"
   }
 }
