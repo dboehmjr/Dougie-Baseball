@@ -29,6 +29,26 @@ LOGS_PATH   = os.path.join(DATA_DIR, "pitcher_game_logs_live.csv")
 SP_PATH     = os.path.join(DATA_DIR, "game_sp_live.csv")
 API_BASE    = "https://statsapi.mlb.com/api/v1"
 
+
+def _sync_logs_to_db(logs_df: pd.DataFrame, sp_df: pd.DataFrame) -> None:
+    try:
+        import database as db_mod
+        conn = db_mod.get_connection()
+        if not logs_df.empty:
+            out = logs_df.copy()
+            out["game_date"] = pd.to_datetime(out["game_date"]).dt.strftime("%Y-%m-%d")
+            db_mod.upsert_df(out, "pitcher_game_logs", conn)
+        if not sp_df.empty:
+            out = sp_df.copy()
+            out = out.rename(columns={"Date": "game_date"})
+            out["game_date"] = pd.to_datetime(out["game_date"]).dt.strftime("%Y-%m-%d")
+            keep = ["game_date", "year", "home_team", "away_team", "game_number", "game_pk",
+                    "home_sp_id", "home_sp_name", "away_sp_id", "away_sp_name"]
+            db_mod.upsert_df(out[[c for c in keep if c in out.columns]], "game_starters", conn)
+        conn.close()
+    except Exception as exc:
+        print(f"  [pitcher_logs→DB] warning: {exc}")
+
 SEASON_START = date(2026, 3, 18)
 
 # MLB Stats API team ID → our abbreviation
@@ -155,9 +175,12 @@ def parse_boxscore(game: dict, boxscore: dict) -> tuple[list[dict], dict | None]
                     away_sp_name = name
 
     if home_sp_id and away_sp_id:
+        game_date = pd.to_datetime(game["game_date"])
         sp_row = {
-            "Date":          game["game_date"],
-            "year":          int(game["game_date"][:4]),
+            "Date":          str(game_date.date()),
+            "game_pk":       game["gamePk"],
+            "game_number":   game.get("game_number", 1),
+            "year":          int(game_date.year),
             "home_team":     game["home_team"],
             "away_team":     game["away_team"],
             "home_sp_id":    home_sp_id,
@@ -169,20 +192,75 @@ def parse_boxscore(game: dict, boxscore: dict) -> tuple[list[dict], dict | None]
     return log_rows, sp_row
 
 
-def load_existing(path: str, key_cols: list[str]) -> tuple[pd.DataFrame, set]:
-    if not os.path.exists(path):
-        return pd.DataFrame(), set()
-    df = pd.read_csv(path)
-    already = set(zip(*[df[c].astype(str) for c in key_cols]))
+def load_existing(path: str, key_cols: list[str], table: str | None = None) -> tuple[pd.DataFrame, set]:
+    df = pd.DataFrame()
+    if table:
+        try:
+            import database as db_mod
+            df = db_mod.read_table(table)
+            if table == "game_starters" and not df.empty:
+                df = df.rename(columns={"game_date": "Date"})
+                df["Date"] = pd.to_datetime(df["Date"])
+                df = df[df["Date"].dt.date >= SEASON_START].copy()
+            if table == "pitcher_game_logs" and not df.empty:
+                df["game_date"] = pd.to_datetime(df["game_date"])
+                df = df[df["game_date"].dt.date >= SEASON_START].copy()
+        except Exception as exc:
+            print(f"  [{table} DB read] warning: {exc}")
+            df = pd.DataFrame()
+    if df.empty and os.path.exists(path):
+        df = pd.read_csv(path)
+    if any(c not in df.columns for c in key_cols):
+        return df, set()
+    keyed = df.dropna(subset=key_cols)
+    already = set(zip(*[keyed[c].astype(str) for c in key_cols]))
     return df, already
+
+
+def _attach_game_numbers(games: list[dict]) -> list[dict]:
+    if not games:
+        return games
+    from feature_engineering import add_game_identity
+
+    df = pd.DataFrame(games).rename(columns={"game_date": "Date", "gamePk": "game_pk"})
+    df["_source_order"] = pd.to_numeric(df["game_pk"], errors="coerce")
+    df = add_game_identity(df)
+    df = df.rename(columns={"Date": "game_date", "game_pk": "gamePk"})
+    return df.drop(columns=["_source_order"], errors="ignore").to_dict("records")
+
+
+def _prepare_sp_cache(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach stable game_number values for same-date/same-team doubleheaders."""
+    if df.empty:
+        return df
+    from feature_engineering import add_game_identity
+
+    out = df.copy()
+    out["Date"] = pd.to_datetime(out["Date"])
+    if "game_pk" in out.columns:
+        out["_source_order"] = pd.to_numeric(out["game_pk"], errors="coerce")
+    out = add_game_identity(out)
+    return out
 
 
 def fetch_and_save(start: date, end: date) -> tuple[int, int]:
     """Fetch from start..end, skip already-cached games. Returns (new_log_rows, new_sp_rows)."""
-    log_df, log_already = load_existing(LOGS_PATH, ["game_id"])
-    sp_df,  sp_already  = load_existing(SP_PATH,   ["Date", "home_team"])
+    log_df, log_already = load_existing(LOGS_PATH, ["game_id"], "pitcher_game_logs")
+    sp_df,  sp_already  = load_existing(SP_PATH,   ["game_pk"], "game_starters")
+    sp_identity_already = set()
+    if not sp_df.empty and {"Date", "home_team", "away_team"}.issubset(sp_df.columns):
+        game_numbers = (
+            sp_df["game_number"] if "game_number" in sp_df.columns
+            else pd.Series(1, index=sp_df.index)
+        )
+        sp_identity_already = set(zip(
+            pd.to_datetime(sp_df["Date"]).dt.strftime("%Y-%m-%d"),
+            sp_df["home_team"].astype(str),
+            sp_df["away_team"].astype(str),
+            game_numbers.astype(str),
+        ))
 
-    games = fetch_completed_games(start, end)
+    games = _attach_game_numbers(fetch_completed_games(start, end))
     print(f"  Found {len(games)} completed games {start}–{end}")
 
     new_logs = []
@@ -191,9 +269,15 @@ def fetch_and_save(start: date, end: date) -> tuple[int, int]:
 
     for g in games:
         game_id  = f"mlb_{g['gamePk']}"
-        sp_key   = (g["game_date"], g["home_team"])
+        sp_key   = (str(g["gamePk"]),)
+        sp_identity_key = (
+            str(pd.to_datetime(g["game_date"]).date()),
+            str(g["home_team"]),
+            str(g["away_team"]),
+            str(g.get("game_number", 1)),
+        )
 
-        if (game_id,) in log_already and sp_key in sp_already:
+        if (game_id,) in log_already and (sp_key in sp_already or sp_identity_key in sp_identity_already):
             skipped += 1
             continue
 
@@ -217,13 +301,24 @@ def fetch_and_save(start: date, end: date) -> tuple[int, int]:
         combined.to_csv(LOGS_PATH, index=False)
 
     if new_sps:
+        if not sp_df.empty and ("game_pk" not in sp_df.columns or sp_df["game_pk"].isna().all()):
+            fetched_dates = set(pd.to_datetime(pd.DataFrame(new_sps)["Date"]).dt.strftime("%Y-%m-%d"))
+            sp_df = sp_df[
+                ~pd.to_datetime(sp_df["Date"]).dt.strftime("%Y-%m-%d").isin(fetched_dates)
+            ]
         combined_sp = pd.concat([sp_df, pd.DataFrame(new_sps)], ignore_index=True) \
                       if not sp_df.empty else pd.DataFrame(new_sps)
-        combined_sp["Date"] = pd.to_datetime(combined_sp["Date"])
-        combined_sp = combined_sp.sort_values(["Date", "home_team"]).drop_duplicates(
-            subset=["Date", "home_team", "away_team"]
-        )
+        combined_sp = _prepare_sp_cache(combined_sp)
+        combined_sp = (combined_sp.sort_values(["Date", "home_team", "away_team", "game_number"])
+                                  .drop_duplicates(subset=["game_id"], keep="last"))
         combined_sp.to_csv(SP_PATH, index=False)
+
+    if new_logs or new_sps:
+        sp_sync = combined_sp if new_sps else pd.DataFrame()
+        _sync_logs_to_db(
+            pd.DataFrame(new_logs) if new_logs else pd.DataFrame(),
+            sp_sync,
+        )
 
     print(f"  Skipped (cached): {skipped} | New log rows: {len(new_logs)} | New SP rows: {len(new_sps)}")
     return len(new_logs), len(new_sps)

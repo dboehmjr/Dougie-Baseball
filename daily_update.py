@@ -27,6 +27,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 import requests
+import database as db_mod
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -138,6 +139,7 @@ def fetch_results_for_date(game_date: date) -> list[dict]:
             continue
         rows.append({
             "Date":       str(game_date),
+            "game_pk":    g.get("gamePk"),
             "year":       game_date.year,
             "home_team":  home,
             "away_team":  away,
@@ -148,29 +150,61 @@ def fetch_results_for_date(game_date: date) -> list[dict]:
     return rows
 
 
+def _prepare_game_log_cache(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize live game rows and attach doubleheader-safe identities."""
+    if df.empty:
+        return df
+    from feature_engineering import add_game_identity, normalize_schedule_team
+
+    out = df.copy()
+    out["Date"] = pd.to_datetime(out["Date"])
+    for col in ["home_team", "away_team"]:
+        out[col] = out[col].apply(normalize_schedule_team)
+    if "game_pk" in out.columns:
+        out["_source_order"] = pd.to_numeric(out["game_pk"], errors="coerce")
+    out = add_game_identity(out)
+    return out
+
+
 def update_game_logs(through: date, full_season: bool = False) -> int:
     """
     Fetch any missing game results from the MLB Stats API and append to
     game_logs_live.csv.  Returns the number of new rows added.
     """
     existing = pd.DataFrame()
-    if os.path.exists(LIVE_RESULTS_PATH) and not full_season:
+    if not full_season:
+        try:
+            import database as _db_mod
+            existing = _db_mod.load_game_results(through.year, through.year)
+            if not existing.empty:
+                existing = existing[
+                    (existing["Date"].dt.date >= SEASON_START)
+                    & (existing["Date"].dt.date <= through)
+                ].copy()
+        except Exception as exc:
+            print(f"  [game_logs DB read] warning: {exc}")
+    if existing.empty and os.path.exists(LIVE_RESULTS_PATH) and not full_season:
         existing = pd.read_csv(LIVE_RESULTS_PATH, parse_dates=["Date"])
 
-    already = set(
-        zip(existing["Date"].astype(str), existing["home_team"])
-    ) if not existing.empty else set()
+    existing_prepared = _prepare_game_log_cache(existing) if not existing.empty else existing
+    already = (
+        set(existing_prepared["game_pk"].dropna().astype(str))
+        if not existing_prepared.empty and "game_pk" in existing_prepared.columns
+        else set()
+    )
 
     fetch_from = SEASON_START if full_season else (
-        (pd.to_datetime(existing["Date"].max()).date() + timedelta(days=1))
-        if not existing.empty else SEASON_START
+        pd.to_datetime(existing["Date"].max()).date() if not existing.empty else SEASON_START
     )
 
     all_rows = []
     d = fetch_from
     while d <= through:
         rows = fetch_results_for_date(d)
-        new  = [r for r in rows if (str(r["Date"]), r["home_team"]) not in already]
+        new  = [
+            r for r in rows
+            if not r.get("game_pk") or str(r["game_pk"]) not in already
+        ]
         all_rows.extend(new)
         d += timedelta(days=1)
         time.sleep(0.15)
@@ -178,14 +212,35 @@ def update_game_logs(through: date, full_season: bool = False) -> int:
     if not all_rows:
         return 0
 
-    new_df   = pd.DataFrame(all_rows)
+    new_df = pd.DataFrame(all_rows)
+    before_keys = set(existing_prepared["game_id"]) if not existing_prepared.empty else set()
+    if not existing.empty and ("game_pk" not in existing.columns or existing["game_pk"].isna().all()):
+        fetched_dates = set(pd.to_datetime(new_df["Date"]).dt.strftime("%Y-%m-%d"))
+        existing = existing[
+            ~pd.to_datetime(existing["Date"]).dt.strftime("%Y-%m-%d").isin(fetched_dates)
+        ]
     combined = pd.concat([existing, new_df], ignore_index=True) if not existing.empty else new_df
-    combined["Date"] = pd.to_datetime(combined["Date"])
-    combined = combined.sort_values(["Date", "home_team"]).drop_duplicates(
-        subset=["Date", "home_team", "away_team"]
-    )
+    combined = _prepare_game_log_cache(combined)
+    combined = (combined.sort_values(["Date", "home_team", "away_team", "game_number"])
+                        .drop_duplicates(subset=["game_id"], keep="last"))
     combined.to_csv(LIVE_RESULTS_PATH, index=False)
-    return len(all_rows)
+    after_keys = set(combined["game_id"])
+
+    # Write new rows to DB
+    try:
+        import database as _db_mod
+        _conn = _db_mod.get_connection()
+        db_rows = combined.copy()
+        db_rows = db_rows.rename(columns={"Date": "game_date"})
+        db_rows["game_date"] = db_rows["game_date"].dt.strftime("%Y-%m-%d")
+        keep = ["game_id", "game_date", "year", "home_team", "away_team",
+                "home_runs", "away_runs", "home_win", "game_number", "game_pk"]
+        _db_mod.upsert_df(db_rows[[c for c in keep if c in db_rows.columns]], "game_logs", _conn)
+        _conn.close()
+    except Exception as exc:
+        print(f"  [game_logs→DB] warning: {exc}")
+
+    return len(after_keys - before_keys)
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +294,13 @@ def fetch_transactions(days_back: int = 7) -> pd.DataFrame:
     if not df.empty:
         df = df.sort_values("date", ascending=False).reset_index(drop=True)
         df.to_csv(TRANSACTIONS_PATH, index=False)
+        try:
+            import database as _db_mod
+            _conn = _db_mod.get_connection()
+            _db_mod.replace_table(df, "transactions_live", _conn)
+            _conn.close()
+        except Exception as exc:
+            print(f"  [transactions→DB] warning: {exc}")
 
     return df
 
@@ -345,7 +407,16 @@ def run_il_refresh() -> bool:
         # Also write today's live counts into il_counts.csv so feature
         # engineering always has a fresh snapshot for the current date.
         il_path = os.path.join(DATA_DIR, "il_counts.csv")
-        existing = pd.read_csv(il_path, parse_dates=["date"]) if os.path.exists(il_path) else pd.DataFrame()
+        try:
+            import database as _db_mod
+            existing = _db_mod.read_table("il_counts").rename(columns={"date": "date"})
+            if not existing.empty:
+                existing["date"] = pd.to_datetime(existing["date"])
+        except Exception as exc:
+            print(f"  [il_counts DB read] warning: {exc}")
+            existing = pd.DataFrame()
+        if existing.empty and os.path.exists(il_path):
+            existing = pd.read_csv(il_path, parse_dates=["date"])
         today_str = str(today)
         already_today = (
             not existing.empty
@@ -363,6 +434,15 @@ def run_il_refresh() -> bool:
             combined = pd.concat([existing, today_df], ignore_index=True)
             combined = combined.drop_duplicates(subset=["date", "team"]).sort_values(["team", "date"])
             combined.to_csv(il_path, index=False)
+            try:
+                import database as _db_mod
+                conn = _db_mod.get_connection()
+                db_rows = combined.copy()
+                db_rows["date"] = pd.to_datetime(db_rows["date"]).dt.strftime("%Y-%m-%d")
+                _db_mod.upsert_df(db_rows, "il_counts", conn)
+                conn.close()
+            except Exception as exc:
+                print(f"  [il_counts→DB] warning: {exc}")
             print(f"  Today's IL snapshot added ({len(rows)} teams)")
 
         print(f"  IL counts refreshed: {len(df):,} rows")
@@ -378,10 +458,10 @@ def run_il_quality_refresh() -> bool:
         from fetch_il_data import fetch_all_il_quality
         from datetime import date as _date
         war_path = os.path.join(DATA_DIR, "player_war.csv")
-        if not os.path.exists(war_path):
+        if not db_mod.table_exists("player_war") and not os.path.exists(war_path):
             print("  player_war.csv not found — run fetch_player_war.py first")
             return False
-        war_df = pd.read_csv(war_path)
+        war_df = db_mod.read_table_or_csv("player_war", war_path)
         df = fetch_all_il_quality(war_df, start_year=2015, end_year=_date.today().year)
         print(f"  IL quality refreshed: {len(df):,} rows")
         return True
@@ -432,6 +512,24 @@ def run_handedness_backfill() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 8b. Live state-impact features
+# ---------------------------------------------------------------------------
+
+def run_state_impact_live_refresh(through: date, full_season: bool = False) -> bool:
+    """Refresh current-season RE24/game-state-impact features from MLB play-by-play."""
+    try:
+        from fetch_state_impact_live import update_live_state_impact, SEASON_START
+        start = SEASON_START if full_season else max(SEASON_START, through - timedelta(days=21))
+        n_pa, n_features = update_live_state_impact(start, through)
+        print(f"  Live state-impact play records: {n_pa:,}")
+        print(f"  State-impact feature rows: {n_features:,}")
+        return True
+    except Exception as exc:
+        print(f"  Live state-impact refresh FAILED: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # 9. Re-run feature engineering
 # ---------------------------------------------------------------------------
 
@@ -462,10 +560,10 @@ def run_feature_engineering() -> bool:
 def print_hot_cold_summary(n: int = 5) -> None:
     """Print the hottest and coldest teams based on momentum (last7 vs last15 run diff)."""
     features_path = os.path.join(DATA_DIR, "features.csv")
-    if not os.path.exists(features_path):
+    if not db_mod.table_exists("features") and not os.path.exists(features_path):
         return
 
-    df    = pd.read_csv(features_path, parse_dates=["Date"])
+    df    = db_mod.read_table_or_csv("features", features_path, parse_dates=["Date"])
     today = pd.Timestamp.today().normalize()
 
     # Get latest snapshot per team
@@ -553,9 +651,14 @@ if __name__ == "__main__":
     print("\n[1/5] Fetching game results…")
     try:
         n_new = update_game_logs(through, full_season=args.full)
-        live  = pd.read_csv(LIVE_RESULTS_PATH)
+        conn = db_mod.get_connection()
+        live_count = conn.execute(
+            "SELECT COUNT(*) FROM game_logs WHERE year = ?",
+            (through.year,),
+        ).fetchone()[0]
+        conn.close()
         print(f"  New games added : {n_new}")
-        print(f"  Total live games: {len(live):,}")
+        print(f"  Total {through.year} games in DB: {live_count:,}")
     except Exception as e:
         print(f"  ERROR fetching results: {e}")
 
@@ -621,15 +724,18 @@ if __name__ == "__main__":
     print("\n[8/11] Backfilling pitcher handedness…")
     run_handedness_backfill()
 
+    # Step 8b: live state-impact features
+    print("\n[8b/11] Refreshing live state-impact form features…")
+    run_state_impact_live_refresh(through, full_season=args.full)
+
     # Step 9: feature engineering
     if not args.skip_features:
         print("\n[9/11] Rebuilding feature matrix…")
         ok = run_feature_engineering()
         if ok:
             features_path = os.path.join(DATA_DIR, "features.csv")
-            if os.path.exists(features_path):
-                feat_df = pd.read_csv(features_path)
-                print(f"  Features rebuilt  : {len(feat_df):,} rows × {len(feat_df.columns)} cols")
+            feat_df = db_mod.read_table_or_csv("features", features_path)
+            print(f"  Features rebuilt  : {len(feat_df):,} rows × {len(feat_df.columns)} cols")
         print_hot_cold_summary()
     else:
         print("\n[9/9] Skipping feature engineering (--skip-features)")

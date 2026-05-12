@@ -27,6 +27,7 @@ from fetch_statcast_batting import get_team_statcast
 from fetch_odds import load_or_fetch_odds, get_home_implied_prob, get_moneyline_str
 from fetch_splits import fetch_all_splits, get_team_split_ops
 from fetch_lineups import fetch_confirmed_lineups, get_lineup_ops
+from feature_defaults import apply_feature_defaults
 
 DATA_DIR  = os.path.join(os.path.dirname(__file__), "data")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
@@ -37,6 +38,7 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 # ---------------------------------------------------------------------------
 _FILE_CACHE: dict = {}
 _MODEL_CACHE: dict = {}
+_DB_CACHE: dict = {}
 
 
 def _load_csv(path: str, **kwargs) -> pd.DataFrame | None:
@@ -47,6 +49,90 @@ def _load_csv(path: str, **kwargs) -> pd.DataFrame | None:
     if key not in _FILE_CACHE:
         _FILE_CACHE[key] = pd.read_csv(path, **kwargs)
     return _FILE_CACHE[key]
+
+
+def _load_db_table(table: str,
+                   parse_dates: list[str] | None = None,
+                   rename: dict | None = None,
+                   query: str | None = None) -> pd.DataFrame | None:
+    """Read a SQLite table from mlb.db, falling back to CSV callers on failure."""
+    try:
+        import database as db_mod
+        db_path = db_mod.DB_PATH
+        if not os.path.exists(db_path):
+            return None
+        wal_path = f"{db_path}-wal"
+        db_mtime = max(
+            os.path.getmtime(db_path),
+            os.path.getmtime(wal_path) if os.path.exists(wal_path) else 0,
+        )
+        key = (table, query or table, db_mtime)
+        if key not in _DB_CACHE:
+            conn = db_mod.get_connection()
+            sql = query or f'SELECT * FROM "{table}"'
+            df = pd.read_sql(sql, conn)
+            conn.close()
+            if rename:
+                df = df.rename(columns=rename)
+            for col in parse_dates or []:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col])
+            _DB_CACHE[key] = df
+        return _DB_CACHE[key].copy()
+    except Exception:
+        return None
+
+
+def _load_prediction_game_logs() -> pd.DataFrame | None:
+    df = _load_db_table("game_logs", parse_dates=["Date"],
+                        rename={"game_date": "Date"})
+    if df is not None and not df.empty:
+        return df
+    return _load_csv(os.path.join(DATA_DIR, "game_logs_live.csv"), parse_dates=["Date"])
+
+
+def _load_pitcher_game_logs() -> pd.DataFrame | None:
+    df = _load_db_table("pitcher_game_logs", parse_dates=["game_date"])
+    if df is not None and not df.empty:
+        return df
+    gl_path = os.path.join(DATA_DIR, "pitcher_game_logs.csv")
+    gl_live_path = os.path.join(DATA_DIR, "pitcher_game_logs_live.csv")
+    game_logs_df = _load_csv(gl_path, parse_dates=["game_date"])
+    live_gl = (_load_csv(gl_live_path, parse_dates=["game_date"])
+               if os.path.exists(gl_live_path) else None)
+    if live_gl is not None and not live_gl.empty:
+        if game_logs_df is not None and not game_logs_df.empty:
+            return pd.concat([game_logs_df, live_gl], ignore_index=True).drop_duplicates(
+                subset=["game_id", "pitcher_id"]
+            )
+        return live_gl
+    return game_logs_df
+
+
+def _load_weather_data() -> pd.DataFrame | None:
+    df = _load_db_table("game_weather", parse_dates=["date"],
+                        rename={"game_date": "date"})
+    if df is not None and not df.empty:
+        return df
+    return _load_csv(os.path.join(DATA_DIR, "weather.csv"), parse_dates=["date"])
+
+
+def _load_pitcher_stuff_data() -> pd.DataFrame | None:
+    df = _load_db_table("pitcher_stuff")
+    if df is not None and not df.empty:
+        return df.rename(columns={
+            "throws": "Throws", "fbv": "FBv", "swstr_pct": "SwStr_pct",
+            "k_pct": "K_pct", "xfip": "xFIP", "gs": "GS",
+        })
+    return _load_csv(os.path.join(DATA_DIR, "pitcher_stuff.csv"))
+
+
+def _load_table_or_csv(table: str, csv_name: str,
+                       parse_dates: list[str] | None = None) -> pd.DataFrame | None:
+    df = _load_db_table(table, parse_dates=parse_dates)
+    if df is not None and not df.empty:
+        return df
+    return _load_csv(os.path.join(DATA_DIR, csv_name), parse_dates=parse_dates)
 
 
 def _load_model(model_path: str) -> dict:
@@ -690,11 +776,25 @@ def predict_matchup(home_team: str,
     home_team = canonical_team(home_team)
     away_team = canonical_team(away_team)
 
+    def _is_unknown_sp(name: str | None) -> bool:
+        if name is None:
+            return False
+        return str(name).strip().lower() in {"", "tbd", "tb/a", "to be determined", "unknown"}
+
+    home_sp_unknown = _is_unknown_sp(home_sp_name)
+    away_sp_unknown = _is_unknown_sp(away_sp_name)
+    if home_sp_unknown:
+        home_sp_name = None
+    if away_sp_unknown:
+        away_sp_name = None
+
+    blend_model_path = os.path.join(MODEL_DIR, "win_prob_blend_trees.pkl")
     independent_model_path = os.path.join(MODEL_DIR, "win_prob_model.pkl")
     market_model_path = os.path.join(MODEL_DIR, "win_prob_market_model.pkl")
-    if not os.path.exists(independent_model_path):
+    if not os.path.exists(blend_model_path) and not os.path.exists(independent_model_path):
         raise FileNotFoundError(
-            f"Model not found at {independent_model_path}. Run train_model.py first."
+            f"Model not found at {blend_model_path} or {independent_model_path}. "
+            "Run train_pure_baseball_ensemble.py first."
         )
 
     valid_model_modes = {"auto", "independent", "market"}
@@ -703,8 +803,8 @@ def predict_matchup(home_team: str,
             f"model_mode must be one of {sorted(valid_model_modes)}, got {model_mode!r}"
         )
 
-    features_df = _load_csv(os.path.join(DATA_DIR, "features.csv"), parse_dates=["Date"])
-    live_logs   = _load_csv(os.path.join(DATA_DIR, "game_logs_live.csv"), parse_dates=["Date"])
+    features_df = _load_table_or_csv("features", "features.csv", parse_dates=["Date"])
+    live_logs   = _load_prediction_game_logs()
 
     # Resolve game date (default = today)
     gdate = pd.Timestamp(game_date) if game_date else pd.Timestamp.today().normalize()
@@ -728,9 +828,8 @@ def predict_matchup(home_team: str,
     home_feats.update(h2h)
 
     # Weather at game time
-    wx_path = os.path.join(DATA_DIR, "weather.csv")
     try:
-        weather_df = _load_csv(wx_path, parse_dates=["date"])
+        weather_df = _load_weather_data()
         wx = get_game_weather(home_team, str(gdate.date()), weather_df) if weather_df is not None else {}
     except Exception:
         wx = {}
@@ -752,7 +851,7 @@ def predict_matchup(home_team: str,
     # Prior-season team batting OPS (use year-1 to match training logic)
     bat_path = os.path.join(DATA_DIR, "batting_stats.csv")
     try:
-        batting_df = _load_csv(bat_path)
+        batting_df = _load_table_or_csv("batting_stats", "batting_stats.csv")
         home_ops = get_team_ops(home_team, year - 1, batting_df) if batting_df is not None else np.nan
         away_ops = get_team_ops(away_team, year - 1, batting_df) if batting_df is not None else np.nan
     except Exception:
@@ -762,7 +861,7 @@ def predict_matchup(home_team: str,
 
     # Prior-season Statcast batting (barrel rate, hard hit%)
     try:
-        statcast_df = _load_csv(os.path.join(DATA_DIR, "statcast_batting.csv"))
+        statcast_df = _load_table_or_csv("statcast_batting", "statcast_batting.csv")
         home_sc = get_team_statcast(home_team, year - 1, statcast_df)
         away_sc = get_team_statcast(away_team, year - 1, statcast_df)
     except Exception:
@@ -773,21 +872,9 @@ def predict_matchup(home_team: str,
     away_feats["hard_hit_pct"] = away_sc.get("hard_hit_pct", np.nan)
 
     # Compute bullpen usage (outs in last 3 days) from Retrosheet + live logs
-    gl_path      = os.path.join(DATA_DIR, "pitcher_game_logs.csv")
-    gl_live_path = os.path.join(DATA_DIR, "pitcher_game_logs_live.csv")
     ump_path     = os.path.join(DATA_DIR, "umpire_game_logs.csv")
     try:
-        game_logs_df = _load_csv(gl_path, parse_dates=["game_date"])
-        # Merge 2026 live pitcher logs so bullpen usage + SP workload use current data
-        live_gl = (_load_csv(gl_live_path, parse_dates=["game_date"])
-                   if os.path.exists(gl_live_path) else None)
-        if live_gl is not None and not live_gl.empty:
-            if game_logs_df is not None and not game_logs_df.empty:
-                game_logs_df = pd.concat(
-                    [game_logs_df, live_gl], ignore_index=True
-                ).drop_duplicates(subset=["game_id", "pitcher_id"])
-            else:
-                game_logs_df = live_gl
+        game_logs_df = _load_pitcher_game_logs()
         if game_logs_df is not None and not game_logs_df.empty:
             home_bu = compute_bullpen_usage_live(home_team, gdate, game_logs_df)
             away_bu = compute_bullpen_usage_live(away_team, gdate, game_logs_df)
@@ -801,7 +888,7 @@ def predict_matchup(home_team: str,
     away_feats["bullpen_outs_3d"] = away_bu
 
     # IL counts — live API for recent games (cached per day), snapshot for history
-    il_snapshot = _load_csv(os.path.join(DATA_DIR, "il_counts.csv"), parse_dates=["date"])
+    il_snapshot = _load_table_or_csv("il_counts", "il_counts.csv", parse_dates=["date"])
     home_il = _il_from_snapshot(home_team, gdate, il_snapshot)
     away_il = _il_from_snapshot(away_team, gdate, il_snapshot)
     home_feats["il_count"] = home_il
@@ -810,7 +897,7 @@ def predict_matchup(home_team: str,
     # IL quality — WAR-weighted score for players currently on IL
     war_path = os.path.join(DATA_DIR, "player_war.csv")
     try:
-        war_df = _load_csv(war_path)
+        war_df = _load_table_or_csv("player_war", "player_war.csv")
         if war_df is not None and not war_df.empty:
             # For recent games use live API; for historical fall back to il_quality.csv snapshot
             days_ago = (pd.Timestamp.today().normalize() - gdate).days
@@ -818,8 +905,8 @@ def predict_matchup(home_team: str,
                 home_il_war = get_current_il_quality(home_team, str(gdate.date()), war_df)
                 away_il_war = get_current_il_quality(away_team, str(gdate.date()), war_df)
             else:
-                il_quality_df = _load_csv(os.path.join(DATA_DIR, "il_quality.csv"),
-                                          parse_dates=["date"])
+                il_quality_df = _load_table_or_csv("il_quality", "il_quality.csv",
+                                                   parse_dates=["date"])
                 def _war_from_snapshot(team: str) -> float:
                     if il_quality_df is None or il_quality_df.empty:
                         return np.nan
@@ -836,32 +923,50 @@ def predict_matchup(home_team: str,
     away_feats["il_war"] = away_il_war
 
     # Umpire run factor
-    ump_logs_df = _load_csv(ump_path, parse_dates=["game_date"]) if os.path.exists(ump_path) else None
+    ump_logs_df = _load_db_table("umpire_game_logs", parse_dates=["game_date"])
+    if ump_logs_df is None or ump_logs_df.empty:
+        ump_logs_df = _load_csv(ump_path, parse_dates=["game_date"]) if os.path.exists(ump_path) else None
     ump_factor = get_ump_run_factor(ump_name, gdate, game_logs_df, ump_logs_df)
     home_feats["ump_run_factor"] = ump_factor
 
     # SP pitch stuff — FBv, SwStr%, K%, xFIP, handedness
     home_sp_throws = away_sp_throws = None
     try:
-        pitcher_stuff_df = _load_csv(os.path.join(DATA_DIR, "pitcher_stuff.csv"))
+        pitcher_stuff_df = _load_pitcher_stuff_data()
         # For live/future predictions, use current-season SP stuff when the
         # pitcher has enough PA; get_pitcher_stuff blends small samples with
         # prior-year data. Historical training still uses prior-season values
         # to avoid leakage.
         stuff_year = year
-        # Prefer explicitly supplied SP names; fall back to last known from features
-        if home_sp_name:
+        empty_stuff = {
+            "FBv": np.nan, "SwStr_pct": np.nan, "K_pct": np.nan,
+            "xFIP": np.nan, "Throws": None, "GS": np.nan, "pa": np.nan,
+        }
+        # Prefer explicitly supplied SP names; fall back to last known from features.
+        # A literal TBD is different from "not supplied": keep it neutral instead
+        # of using a team median or a stale recent starter.
+        if home_sp_unknown:
+            home_sp_norm = None
+            home_stuff = empty_stuff.copy()
+        elif home_sp_name:
             home_sp_norm = _normalize_name(home_sp_name)
+            home_stuff = get_pitcher_stuff(home_sp_norm or "", home_team, stuff_year,
+                                           pitcher_stuff_df)
         else:
             home_sp_norm = _get_recent_sp_name(home_team, gdate, features_df, side="home")
-        if away_sp_name:
+            home_stuff = get_pitcher_stuff(home_sp_norm or "", home_team, stuff_year,
+                                           pitcher_stuff_df)
+        if away_sp_unknown:
+            away_sp_norm = None
+            away_stuff = empty_stuff.copy()
+        elif away_sp_name:
             away_sp_norm = _normalize_name(away_sp_name)
+            away_stuff = get_pitcher_stuff(away_sp_norm or "", away_team, stuff_year,
+                                           pitcher_stuff_df)
         else:
             away_sp_norm = _get_recent_sp_name(away_team, gdate, features_df, side="away")
-        home_stuff = get_pitcher_stuff(home_sp_norm or "", home_team, stuff_year,
-                                       pitcher_stuff_df)
-        away_stuff = get_pitcher_stuff(away_sp_norm or "", away_team, stuff_year,
-                                       pitcher_stuff_df)
+            away_stuff = get_pitcher_stuff(away_sp_norm or "", away_team, stuff_year,
+                                           pitcher_stuff_df)
         home_feats.update({k: v for k, v in {
             "sp_fbv": home_stuff["FBv"], "sp_swstr": home_stuff["SwStr_pct"],
             "sp_k_pct": home_stuff["K_pct"], "sp_xfip": home_stuff["xFIP"],
@@ -900,7 +1005,7 @@ def predict_matchup(home_team: str,
 
     # L/R batting splits (OPS vs SP handedness)
     try:
-        splits_df = _load_csv(os.path.join(DATA_DIR, "team_splits.csv"))
+        splits_df = _load_table_or_csv("team_splits", "team_splits.csv")
         home_feats["batting_ops_vs_sp"] = get_team_split_ops(
             home_team, year, away_sp_throws, splits_df)
         away_feats["batting_ops_vs_sp"] = get_team_split_ops(
@@ -953,22 +1058,46 @@ def predict_matchup(home_team: str,
     use_market_model = (
         model_mode == "market"
     )
-    model_path = market_model_path if use_market_model else independent_model_path
+    model_path = market_model_path if use_market_model else (
+        blend_model_path if os.path.exists(blend_model_path) else independent_model_path
+    )
     if use_market_model and not os.path.exists(market_model_path):
         raise FileNotFoundError(
             f"Market-aware model not found at {market_model_path}. Run train_model.py first."
         )
 
     artifact = _load_model(model_path)
-    pipeline = artifact["pipeline"]
     feat_cols = artifact["features"]
 
     X = build_input_row(home_feats, away_feats)
     for col in feat_cols:
         if col not in X.columns:
             X[col] = np.nan
+    X = apply_feature_defaults(X, feat_cols)
     X = X[feat_cols]
-    prob_home_win = pipeline.predict_proba(X)[0, 1]
+    if "pipelines" in artifact:
+        model_probs = {
+            name: float(pipeline.predict_proba(X)[0, 1])
+            for name, pipeline in artifact["pipelines"].items()
+        }
+        blend_weights = artifact.get("blend_weights") or {}
+        if blend_weights:
+            total_weight = sum(float(blend_weights.get(name, 0.0)) for name in model_probs)
+            if total_weight > 0:
+                prob_home_win = float(
+                    sum(
+                        model_probs[name] * float(blend_weights.get(name, 0.0))
+                        for name in model_probs
+                    ) / total_weight
+                )
+            else:
+                prob_home_win = float(np.mean(list(model_probs.values())))
+        else:
+            prob_home_win = float(np.mean(list(model_probs.values())))
+    else:
+        pipeline = artifact["pipeline"]
+        model_probs = {}
+        prob_home_win = float(pipeline.predict_proba(X)[0, 1])
 
     if verbose:
         print(f"\n{'='*45}")
@@ -979,6 +1108,9 @@ def predict_matchup(home_team: str,
         print(f"{'='*45}")
         model_label = artifact.get("model_type", "market_aware" if use_market_model else "market_independent")
         print(f"  Probability model        : {model_label}")
+        if model_probs:
+            blend_bits = ", ".join(f"{name} {prob:.1%}" for name, prob in model_probs.items())
+            print(f"  Blend components         : {blend_bits}")
         print(f"\n  Feature snapshot (last {home_team} data):")
         print(f"    Home rolling run-diff  : {home_feats['rolling_rd']:+.2f}")
         print(f"    Away rolling run-diff  : {away_feats['rolling_rd']:+.2f}")

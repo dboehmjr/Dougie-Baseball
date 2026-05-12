@@ -23,6 +23,8 @@ import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import database as db
+from feature_defaults import apply_feature_defaults
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -78,6 +80,15 @@ FEATURE_COLS = [
     "home_bullpen_inseason_era",
     "away_bullpen_inseason_era",
     "bullpen_inseason_era_diff",
+    # Contextual game-state impact form (Retrosheet/MLB RE24-style deltas).
+    # Ablation testing favored pitcher-side state impact; offense RE24 remains
+    # in the feature table for diagnostics but is excluded from training.
+    "home_sp_re24_last3",
+    "away_sp_re24_last3",
+    "sp_re24_diff",
+    "home_bullpen_re24_15d",
+    "away_bullpen_re24_15d",
+    "bullpen_re24_diff",
     # Rest & travel
     "home_days_rest",
     "away_days_rest",
@@ -189,7 +200,8 @@ TEST_YEAR  = 2025   # train on 2015–2024, test on 2025
 # ---------------------------------------------------------------------------
 
 def load_and_split(path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    df = pd.read_csv(path, parse_dates=["Date"])
+    df = db.read_table_or_csv("features", path, parse_dates=["Date"])
+    df = apply_feature_defaults(df, FEATURE_COLS)
     # Only use completed games for training/testing (exclude ongoing 2026 season)
     train = df[df["year"] < TEST_YEAR].copy()
     test  = df[df["year"] == TEST_YEAR].copy()

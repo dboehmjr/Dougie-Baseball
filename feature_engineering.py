@@ -23,6 +23,7 @@ import numpy as np
 # Import weather helpers (park CF bearings + wind projection)
 from fetch_weather import PARK_CF_BEARING, FULL_DOME, wind_to_cf
 from fetch_pitcher_stuff import get_pitcher_stuff
+from feature_defaults import apply_feature_defaults
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
@@ -836,7 +837,7 @@ def compute_sp_workload(game_logs: pd.DataFrame,
     Joined back via game_sp pitcher IDs → returns one row per game with
     home_sp_days_rest, away_sp_days_rest, home_sp_outs_last, away_sp_outs_last.
     """
-    starters = game_logs[game_logs["is_starter"]].copy()
+    starters = game_logs[game_logs["is_starter"] == 1].copy()
     starters["game_date"] = pd.to_datetime(starters["game_date"])
     starters = starters.sort_values(["pitcher_id", "game_date"])
 
@@ -888,7 +889,7 @@ def compute_inseason_sp_era(game_logs: pd.DataFrame,
     Returns: DataFrame with Date, home_team, away_team,
              home_sp_inseason_era, away_sp_inseason_era
     """
-    starters = game_logs[game_logs["is_starter"]].copy()
+    starters = game_logs[game_logs["is_starter"] == 1].copy()
     starters["game_date"] = pd.to_datetime(starters["game_date"])
     starters = starters.sort_values(["pitcher_id", "game_date"])
 
@@ -979,7 +980,7 @@ def compute_inseason_bullpen_era(game_logs: pd.DataFrame,
 
     Returns: DataFrame with game_date, team, bullpen_inseason_era
     """
-    relievers = game_logs[~game_logs["is_starter"]].copy()
+    relievers = game_logs[game_logs["is_starter"] != 1].copy()
     relievers["game_date"] = pd.to_datetime(relievers["game_date"])
 
     # Assign team per appearance
@@ -1039,7 +1040,7 @@ def compute_bullpen_usage(game_logs: pd.DataFrame,
 
     Returns: DataFrame with team, game_date, bullpen_outs_Xd
     """
-    relievers = game_logs[~game_logs["is_starter"]].copy()
+    relievers = game_logs[game_logs["is_starter"] != 1].copy()
     relievers["game_date"] = pd.to_datetime(relievers["game_date"])
     relievers["team"] = np.where(
         relievers["team_side"] == 1,
@@ -1734,6 +1735,44 @@ def attach_il_counts(games: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------------
+# Step 13b – Retrosheet game-state impact form
+#
+# These features are a lightweight, explainable version of the paper's
+# game-state-delta representation.  They are built by build_state_impact_features.py
+# and stored in SQLite as state_impact_features.
+# ---------------------------------------------------------------------------
+
+def attach_state_impact_features(games: pd.DataFrame,
+                                 state_features: pd.DataFrame | None) -> pd.DataFrame:
+    """Attach pregame rolling RE24-style form features from SQLite/CSV."""
+    cols = [
+        "home_offense_re24_15g", "away_offense_re24_15g", "offense_re24_diff",
+        "home_sp_re24_last3", "away_sp_re24_last3", "sp_re24_diff",
+        "home_bullpen_re24_15d", "away_bullpen_re24_15d", "bullpen_re24_diff",
+    ]
+    if state_features is None or state_features.empty:
+        print("  State-impact features missing — run build_state_impact_features.py; defaulting to neutral")
+        for col in cols:
+            games[col] = np.nan
+        return games
+
+    sf = state_features.copy()
+    sf["Date"] = pd.to_datetime(sf["game_date"])
+    for col in ["home_team", "away_team"]:
+        sf[col] = sf[col].apply(normalize_schedule_team)
+    sf["game_number"] = pd.to_numeric(sf.get("game_number", 1), errors="coerce").fillna(1).astype(int)
+    merge_keys = game_merge_keys(games, sf)
+    keep = merge_keys + [c for c in cols if c in sf.columns]
+    out = games.merge(sf[keep].drop_duplicates(merge_keys), on=merge_keys, how="left")
+    for col in cols:
+        if col not in out.columns:
+            out[col] = np.nan
+    cov = out["home_offense_re24_15g"].notna().mean()
+    print(f"  State-impact feature coverage: {cov:.1%}")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Step 14 – build final feature matrix
 # ---------------------------------------------------------------------------
 
@@ -1772,6 +1811,16 @@ FEATURE_COLS = [
     "home_bullpen_inseason_era",
     "away_bullpen_inseason_era",
     "bullpen_inseason_era_diff",
+    # Contextual game-state impact form (Retrosheet RE24-style deltas)
+    "home_offense_re24_15g",
+    "away_offense_re24_15g",
+    "offense_re24_diff",
+    "home_sp_re24_last3",
+    "away_sp_re24_last3",
+    "sp_re24_diff",
+    "home_bullpen_re24_15d",
+    "away_bullpen_re24_15d",
+    "bullpen_re24_diff",
     "park_factor",
     # Rest & travel
     "home_days_rest",
@@ -1921,6 +1970,14 @@ def build_feature_matrix(games: pd.DataFrame) -> pd.DataFrame:
     games["sp_era_adj_diff"]           = games["away_sp_era_adj"]           - games["home_sp_era_adj"]
     games["sp_inseason_era_diff"]      = games["away_sp_inseason_era"]      - games["home_sp_inseason_era"]
     games["bullpen_inseason_era_diff"] = games["away_bullpen_inseason_era"] - games["home_bullpen_inseason_era"]
+    for col in ["home_offense_re24_15g", "away_offense_re24_15g",
+                "home_sp_re24_last3", "away_sp_re24_last3",
+                "home_bullpen_re24_15d", "away_bullpen_re24_15d"]:
+        if col not in games.columns:
+            games[col] = np.nan
+    games["offense_re24_diff"] = games["home_offense_re24_15g"] - games["away_offense_re24_15g"]
+    games["sp_re24_diff"] = games["home_sp_re24_last3"] - games["away_sp_re24_last3"]
+    games["bullpen_re24_diff"] = games["home_bullpen_re24_15d"] - games["away_bullpen_re24_15d"]
     games["rest_diff"]                 = games["home_days_rest"]            - games["away_days_rest"]
     games["travel_diff"]               = games["away_travel_miles"]         - games["home_travel_miles"]
     games["bullpen_usage_diff"]        = games["away_bullpen_outs_3d"]      - games["home_bullpen_outs_3d"]
@@ -2025,6 +2082,7 @@ def build_feature_matrix(games: pd.DataFrame) -> pd.DataFrame:
         "home_runs", "away_runs", TARGET_COL,
     ]
     out = games[id_cols + available].copy()
+    out = apply_feature_defaults(out, available)
     # Drop rows where either rolling_rd is NaN — these are early-season games
     # with < min_periods prior games and would bias training with noisy inputs.
     out = out.dropna(subset=["home_rolling_rd", "away_rolling_rd"], how="any")
@@ -2036,101 +2094,73 @@ def build_feature_matrix(games: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    sp_path = os.path.join(DATA_DIR, "game_sp.csv")
-    if not os.path.exists(sp_path):
-        raise FileNotFoundError(
-            "data/game_sp.csv not found — run fetch_sp_data.py first."
-        )
+    import database as _db
 
-    gl_path  = os.path.join(DATA_DIR, "pitcher_game_logs.csv")
-    ump_path = os.path.join(DATA_DIR, "umpire_game_logs.csv")
-    if not os.path.exists(gl_path):
+    _db_path = _db.DB_PATH
+    if not os.path.exists(_db_path):
         raise FileNotFoundError(
-            "data/pitcher_game_logs.csv not found — run parse_retrosheet_events.py first."
+            f"{_db_path} not found — run python migrate_to_db.py first."
         )
 
     batting_path = os.path.join(DATA_DIR, "batting_stats.csv")
-    weather_path = os.path.join(DATA_DIR, "weather.csv")
-    if not os.path.exists(batting_path):
+    if not _db.table_exists("batting_stats") and not os.path.exists(batting_path):
         raise FileNotFoundError(
-            "data/batting_stats.csv not found — run data_ingestion.py first."
-        )
-    if not os.path.exists(weather_path):
-        raise FileNotFoundError(
-            "data/weather.csv not found — run fetch_weather.py first."
+            "No batting_stats table or data/batting_stats.csv found — run data_ingestion.py first."
         )
 
-    print("Loading raw data...")
-    raw_logs      = pd.read_csv(os.path.join(DATA_DIR, "game_logs_raw.csv"))
-    pitcher_stats = pd.read_csv(os.path.join(DATA_DIR, "pitcher_stats.csv"))
-    batting_stats = pd.read_csv(batting_path)
-    weather       = pd.read_csv(weather_path, parse_dates=["date"])
-    game_sp       = pd.read_csv(sp_path, parse_dates=["Date"])
-    game_logs     = pd.read_csv(gl_path,  parse_dates=["game_date"])
-    for frame in [game_sp, game_logs]:
-        for col in ["home_team", "away_team"]:
-            if col in frame.columns:
-                frame[col] = frame[col].apply(normalize_schedule_team)
+    print("Loading data from mlb.db...")
+    _conn = _db.get_connection()
 
-    # Merge in live (current-season) pitcher data if available
-    live_logs_path = os.path.join(DATA_DIR, "pitcher_game_logs_live.csv")
-    live_sp_path   = os.path.join(DATA_DIR, "game_sp_live.csv")
-    if os.path.exists(live_logs_path):
-        live_logs = pd.read_csv(live_logs_path, parse_dates=["game_date"])
-        for col in ["home_team", "away_team"]:
-            live_logs[col] = live_logs[col].apply(normalize_schedule_team)
-        game_logs = pd.concat([game_logs, live_logs], ignore_index=True).drop_duplicates(
-            subset=["game_id", "pitcher_id"]
-        )
-        print(f"  Merged live pitcher logs: {len(live_logs):,} rows → total {len(game_logs):,}")
-    if os.path.exists(live_sp_path):
-        live_sp = pd.read_csv(live_sp_path, parse_dates=["Date"])
-        for col in ["home_team", "away_team"]:
-            live_sp[col] = live_sp[col].apply(normalize_schedule_team)
-        game_sp = pd.concat([game_sp, live_sp], ignore_index=True).drop_duplicates(
-            subset=["Date", "home_team", "away_team", "home_sp_name", "away_sp_name"]
-        )
-        print(f"  Merged live SP assignments: {len(live_sp):,} rows → total {len(game_sp):,}")
-    ump_logs      = pd.read_csv(ump_path, parse_dates=["game_date"]) if os.path.exists(ump_path) else None
-    il_path       = os.path.join(DATA_DIR, "il_counts.csv")
-    il_df         = pd.read_csv(il_path,  parse_dates=["date"]) if os.path.exists(il_path) else None
+    # --- Game results (unified historical + live, already cleaned) ---
+    _gl = pd.read_sql("SELECT * FROM game_logs ORDER BY game_date, home_team, game_number", _conn)
+    _gl["Date"] = pd.to_datetime(_gl["game_date"])
+    _gl = _gl.rename(columns={"game_date": "_game_date_str"})
+    games = _gl.copy()
+    for col in ["home_team", "away_team"]:
+        games[col] = games[col].apply(normalize_schedule_team)
+    print(f"  {len(games):,} games from game_logs table")
 
-    print("Cleaning game logs...")
-    games = clean_game_logs(raw_logs)
-    print(f"  {len(games):,} home games from pybaseball cache")
+    # --- Pitcher game logs (unified historical + live) ---
+    game_logs = pd.read_sql("SELECT * FROM pitcher_game_logs", _conn)
+    game_logs["game_date"] = pd.to_datetime(game_logs["game_date"])
+    for col in ["home_team", "away_team"]:
+        if col in game_logs.columns:
+            game_logs[col] = game_logs[col].apply(normalize_schedule_team)
+    print(f"  {len(game_logs):,} rows from pitcher_game_logs table")
 
-    # Merge daily-updated live results (written by daily_update.py)
-    live_path = os.path.join(DATA_DIR, "game_logs_live.csv")
-    if os.path.exists(live_path):
-        live = pd.read_csv(live_path, parse_dates=["Date"])
+    # --- SP assignments (unified historical + live) ---
+    _gs = pd.read_sql("SELECT * FROM game_starters", _conn)
+    _gs["Date"] = pd.to_datetime(_gs["game_date"])
+    game_sp = _gs.copy()
+    for col in ["home_team", "away_team"]:
+        game_sp[col] = game_sp[col].apply(normalize_schedule_team)
+    print(f"  {len(game_sp):,} rows from game_starters table")
+
+    # --- Umpire logs ---
+    _ump_raw = pd.read_sql("SELECT * FROM umpire_game_logs", _conn)
+    ump_logs = _ump_raw if not _ump_raw.empty else None
+    if ump_logs is not None:
+        ump_logs["game_date"] = pd.to_datetime(ump_logs["game_date"])
         for col in ["home_team", "away_team"]:
-            live[col] = live[col].apply(normalize_schedule_team)
-        existing_keys = set(zip(
-            games["Date"].dt.strftime("%Y-%m-%d"),
-            games["home_team"],
-            games["away_team"],
-            games["home_runs"],
-            games["away_runs"],
-        ))
-        new_rows = live[
-            ~live.apply(
-                lambda r: (
-                    str(r["Date"])[:10],
-                    r["home_team"],
-                    r["away_team"],
-                    r["home_runs"],
-                    r["away_runs"],
-                ) in existing_keys,
-                axis=1,
-            )
-        ]
-        if not new_rows.empty:
-            games = pd.concat([games, new_rows], ignore_index=True).sort_values("Date")
-            games = add_game_identity(games)
-            print(f"  +{len(new_rows)} games from game_logs_live.csv  → {len(games):,} total")
-        else:
-            print(f"  game_logs_live.csv: no new games beyond pybaseball cache")
-    print(f"  {len(games):,} home games total")
+            if col in ump_logs.columns:
+                ump_logs[col] = ump_logs[col].apply(normalize_schedule_team)
+
+    # --- IL counts ---
+    _il_raw = pd.read_sql("SELECT * FROM il_counts", _conn)
+    il_df = _il_raw if not _il_raw.empty else None
+    if il_df is not None:
+        il_df["date"] = pd.to_datetime(il_df["date"])
+
+    # --- Static per-season data ---
+    pitcher_stats = _db.read_table_or_csv(
+        "pitcher_stats", os.path.join(DATA_DIR, "pitcher_stats.csv"), conn=_conn
+    )
+    batting_stats = _db.read_table_or_csv(
+        "batting_stats", batting_path, conn=_conn
+    )
+
+    _conn.close()
+    print(f"  {len(games):,} games total (DB)")
 
     print("Adding rolling run-differential + runs scored...")
     games = add_rolling_stats(games)
@@ -2150,44 +2180,38 @@ if __name__ == "__main__":
     games = attach_park_dimensions(games)
 
     print("Attaching SP pitch stuff (FanGraphs)...")
-    stuff_path = os.path.join(DATA_DIR, "pitcher_stuff.csv")
-    if os.path.exists(stuff_path):
-        pitcher_stuff = pd.read_csv(stuff_path)
+    _conn2 = _db.get_connection()
+    _stuff_raw = pd.read_sql("SELECT * FROM pitcher_stuff", _conn2)
+    if not _stuff_raw.empty:
+        pitcher_stuff = _stuff_raw.rename(columns={
+            "throws": "Throws", "fbv": "FBv", "swstr_pct": "SwStr_pct",
+            "k_pct": "K_pct", "xfip": "xFIP", "gs": "GS",
+        })
         games = attach_sp_stuff(games, pitcher_stuff)
     else:
-        print("  pitcher_stuff.csv not found — run fetch_pitcher_stuff.py first")
+        print("  pitcher_stuff table empty — run fetch_pitcher_stuff.py first")
         games = attach_sp_stuff(games, None)
 
     print("Computing rest days and travel distance...")
     games = compute_rest_and_travel(games)
 
     print("Attaching prior-season Statcast batting (barrel rate, hard hit%)...")
-    statcast_path = os.path.join(DATA_DIR, "statcast_batting.csv")
-    if os.path.exists(statcast_path):
-        statcast_df = pd.read_csv(statcast_path)
-        games = attach_statcast_batting(games, statcast_df)
-    else:
-        print("  statcast_batting.csv not found — run fetch_statcast_batting.py first")
-        games = attach_statcast_batting(games, None)
+    statcast_df = pd.read_sql("SELECT * FROM statcast_batting", _conn2)
+    games = attach_statcast_batting(games, statcast_df if not statcast_df.empty else None)
 
     print("Attaching prior-season batting quality (team OPS)...")
     games = attach_batting_quality(games, batting_stats)
 
     print("Attaching prior-season batting splits vs opposing SP hand...")
-    splits_path = os.path.join(DATA_DIR, "team_splits.csv")
-    if os.path.exists(splits_path):
-        splits_df = pd.read_csv(splits_path)
-        games = attach_batting_splits_vs_sp(games, splits_df)
-    else:
-        games = attach_batting_splits_vs_sp(games, None)
+    splits_df = pd.read_sql("SELECT * FROM team_splits", _conn2)
+    if not splits_df.empty:
+        splits_df = splits_df.drop_duplicates(subset=["team", "year"], keep="last")
+        splits_df["year"] = splits_df["year"].astype(int)
+    games = attach_batting_splits_vs_sp(games, splits_df if not splits_df.empty else None)
 
     print("Attaching historical starting-lineup split OPS...")
-    lineups_path = os.path.join(DATA_DIR, "historical_lineups.csv")
-    if os.path.exists(lineups_path):
-        historical_lineups = pd.read_csv(lineups_path)
-        games = attach_historical_lineups(games, historical_lineups)
-    else:
-        games = attach_historical_lineups(games, None)
+    _lineups_raw = pd.read_sql("SELECT * FROM historical_lineups", _conn2)
+    games = attach_historical_lineups(games, _lineups_raw if not _lineups_raw.empty else None)
 
     print("Attaching prior-season Pythagorean win%...")
     games = attach_prior_win_pct(games)
@@ -2196,28 +2220,33 @@ if __name__ == "__main__":
     games = compute_h2h_stats(games)
 
     print("Attaching weather data...")
-    games = attach_weather(games, weather)
+    _weather_raw = pd.read_sql("SELECT * FROM game_weather", _conn2)
+    _weather_raw = _weather_raw.rename(columns={"game_date": "date"})
+    _weather_raw["date"] = pd.to_datetime(_weather_raw["date"])
+    games = attach_weather(games, _weather_raw)
 
     print("Attaching umpire run factor...")
     if ump_logs is not None:
         games = attach_umpire_factor(games, ump_logs, game_logs)
     else:
-        print("  umpire_game_logs.csv not found — run parse_retrosheet_events.py; defaulting to 1.0")
+        print("  umpire_game_logs table empty — run parse_retrosheet_events.py; defaulting to 1.0")
         games["ump_run_factor"] = 1.0
 
     print("Attaching IL (Injured List) counts...")
     if il_df is not None:
         games = attach_il_counts(games, il_df)
     else:
-        print("  il_counts.csv not found — run fetch_il_data.py; defaulting to 0")
+        print("  il_counts table empty — run fetch_il_data.py; defaulting to 0")
         games["home_il_count"] = 0
         games["away_il_count"] = 0
         games["il_diff"]       = 0
 
     print("Attaching IL quality (WAR-weighted)...")
     il_quality_path = os.path.join(DATA_DIR, "il_quality.csv")
-    if os.path.exists(il_quality_path):
-        il_quality_df = pd.read_csv(il_quality_path, parse_dates=["date"])
+    if _db.table_exists("il_quality", _conn2) or os.path.exists(il_quality_path):
+        il_quality_df = _db.read_table_or_csv(
+            "il_quality", il_quality_path, parse_dates=["date"], conn=_conn2
+        )
 
         def _attach_il_war(team_col: str, out_col: str) -> pd.Series:
             tq = il_quality_df.rename(columns={"team": "_team", "il_war_score": out_col})
@@ -2246,60 +2275,39 @@ if __name__ == "__main__":
     print("Attaching in-season rolling SP + bullpen ERA...")
     games = attach_inseason_stats(games, game_logs, game_sp, park_factors)
 
-    print("Attaching historical Vegas consensus odds...")
-
-    def _devig(hml, aml):
-        def imp(ml):
-            ml = float(ml)
-            return abs(ml) / (abs(ml) + 100) if ml < 0 else 100 / (ml + 100)
-        ph, pa = imp(hml), imp(aml)
-        return ph / (ph + pa) if (ph + pa) > 0 else np.nan
-
-    odds_frames = []
-
-    # Action Network files (game_date + consensus_prob already computed)
-    for odds_file in ["action_network_odds_2026.csv", "action_network_odds_2022_2025.csv"]:
-        p = os.path.join(DATA_DIR, odds_file)
-        if os.path.exists(p):
-            df = pd.read_csv(p, dtype={"game_date": str})
-            df = df.rename(columns={"game_date": "Date", "consensus_prob": "vegas_home_prob"})
-            for col in ["home_team", "away_team"]:
-                df[col] = df[col].apply(normalize_schedule_team)
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = add_game_identity(df)
-            odds_frames.append(df[["Date", "home_team", "away_team", "game_number", "vegas_home_prob"]])
-
-    # historical_odds.csv (2015-2021): has 'date' + raw home_ml/away_ml, no consensus_prob
-    hist_path = os.path.join(DATA_DIR, "historical_odds.csv")
-    if os.path.exists(hist_path):
-        hist = pd.read_csv(hist_path)
-        hist = hist.rename(columns={"date": "Date"})
-        for col in ["home_team", "away_team"]:
-            hist[col] = hist[col].apply(normalize_schedule_team)
-        hist["vegas_home_prob"] = hist.apply(
-            lambda r: _devig(r["home_ml"], r["away_ml"])
-            if pd.notna(r.get("home_ml")) and pd.notna(r.get("away_ml")) else np.nan,
-            axis=1,
+    print("Attaching Retrosheet state-impact form features...")
+    state_impact_path = os.path.join(DATA_DIR, "state_impact_features.csv")
+    if _db.table_exists("state_impact_features", _conn2) or os.path.exists(state_impact_path):
+        state_impact_df = _db.read_table_or_csv(
+            "state_impact_features", state_impact_path, parse_dates=["game_date"], conn=_conn2
         )
-        hist["Date"] = pd.to_datetime(hist["Date"])
-        hist = add_game_identity(hist)
-        odds_frames.append(hist[["Date", "home_team", "away_team", "game_number", "vegas_home_prob"]])
+    else:
+        state_impact_df = None
+    games = attach_state_impact_features(games, state_impact_df)
 
-    if odds_frames:
-        odds_df = (pd.concat(odds_frames, ignore_index=True)
-                     .dropna(subset=["vegas_home_prob"]))
-        odds_df["Date"] = pd.to_datetime(odds_df["Date"])
-        odds_df = odds_df.drop_duplicates(["Date", "home_team", "away_team", "game_number"])
-        merge_keys = game_merge_keys(games, odds_df)
+    print("Attaching historical Vegas consensus odds...")
+    _odds_raw = pd.read_sql(
+        "SELECT game_date, home_team, away_team, game_number, vegas_home_prob "
+        "FROM game_odds WHERE vegas_home_prob IS NOT NULL",
+        _conn2,
+    )
+    _conn2.close()
+    if not _odds_raw.empty:
+        _odds_raw["Date"] = pd.to_datetime(_odds_raw["game_date"])
+        _odds_raw = _odds_raw.drop(columns=["game_date"])
+        for col in ["home_team", "away_team"]:
+            _odds_raw[col] = _odds_raw[col].apply(normalize_schedule_team)
+        _odds_raw = _odds_raw.drop_duplicates(["Date", "home_team", "away_team", "game_number"])
+        _merge_keys = game_merge_keys(games, _odds_raw)
         games = games.merge(
-            odds_df[merge_keys + ["vegas_home_prob"]],
-            on=merge_keys, how="left"
+            _odds_raw[_merge_keys + ["vegas_home_prob"]],
+            on=_merge_keys, how="left"
         )
         coverage = games["vegas_home_prob"].notna().mean()
         n_games  = games["vegas_home_prob"].notna().sum()
         print(f"  Vegas odds coverage: {coverage:.1%} of games ({n_games:,} games)")
     else:
-        print("  No odds files found — run fetch_historical_odds.py first")
+        print("  game_odds table empty — run fetch_historical_odds.py first")
         games["vegas_home_prob"] = np.nan
 
     print("Building feature matrix...")
@@ -2310,4 +2318,7 @@ if __name__ == "__main__":
 
     out_path = os.path.join(DATA_DIR, "features.csv")
     features.to_csv(out_path, index=False)
+    _conn3 = _db.get_connection()
+    _db.replace_table(features, "features", _conn3)
+    _conn3.close()
     print(f"\nSaved to {out_path} — run train_model.py next.")
